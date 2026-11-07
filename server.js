@@ -24,9 +24,27 @@
  * Valores (/settings): a Administracao edita corrida, entrega e diaria;
  * o servidor guarda em MEMORIA e todos os aparelhos leem daqui, para o
  * valor valer em todos os aparelhos e nao so onde foi editado.
+ *
+ * Contas (/auth): registro e login no SERVIDOR (telefone + senha), para
+ * a mesma conta funcionar em qualquer aparelho — antes a conta so
+ * existia no localStorage de cada aparelho e a conta criada no celular
+ * nao existia no PC (o login no PC dizia "incorreto" mesmo com a senha
+ * certa). Senhas nunca ficam em texto claro: scrypt com salt (crypto
+ * nativo, sem dependencia nova). Contas e sessoes ficam em accounts.json
+ * (escrita atomica: grava temporario e renomeia), lido na inicializacao.
+ * A primeira conta registrada vira admin (como era no aparelho: a
+ * primeira conta criada). No Render Free o disco e efemero: se o
+ * servico reiniciar, o arquivo some e as contas voltam pela migracao
+ * automatica do app (ele reenvia a conta local uma vez); no VPS o disco
+ * persiste e nada se perde. O Postgres gratuito do Render NAO serve
+ * aqui: ele expira e e apagado depois de ~30 dias, entao as contas
+ * sumiriam sozinhas.
  */
 
 const express = require("express");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -45,7 +63,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
     if (req.method === "OPTIONS") {
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Access-Control-Max-Age", "86400");
       return res.sendStatus(204);
     }
@@ -120,7 +138,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.2.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.3.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -653,6 +671,384 @@ app.post("/calls/:id/complete", (req, res) => {
   c.updatedAt = Date.now();
   return res.json({ ok: true, call: callPublic(c) });
 });
+
+// ---------------------------------------------------------------------------
+// Contas (/auth) — registro e login no SERVIDOR
+//
+// Por que no servidor: a conta antes so existia no localStorage de cada
+// aparelho (mtt_contas_v1). A conta criada no celular nao existia no PC
+// e o login no PC dizia "incorreto" mesmo com a senha certa. Agora a
+// conta vive no servidor e o mesmo telefone + senha entra em qualquer
+// aparelho; o aparelho guarda so o token da sessao (nunca a senha).
+//
+// Senhas: scrypt (crypto nativo) com salt aleatorio de 16 bytes;
+// guardamos "salt:hash" em hexadecimal. Nada de texto claro em arquivo,
+// em log ou em resposta. Comparacao com timingSafeEqual.
+//
+// Persistencia: accounts.json ao lado do server.js, escrita atomica
+// (grava accounts.json.tmp e renomeia por cima — um corte no meio nao
+// corrompe o arquivo). Lido na inicializacao; se nao existir ou estiver
+// corrompido, comeca vazio e registra o aviso no log. No Render Free o
+// disco e efemero (reinicio apaga o arquivo): as contas voltam pela
+// migracao automatica do app, que reenvia a conta local quando o
+// servidor nao a conhece. No VPS (disco persistente) nada se perde.
+// O Postgres gratuito do Render NAO serve aqui: ele expira e e apagado
+// depois de ~30 dias (foi o que aconteceu com o banco do Gestor), entao
+// as contas sumiriam sozinhas. Quando o app for para o VPS, este mesmo
+// arquivo ja e a persistencia definitiva, sem mudar nada no codigo.
+//
+// Admin: a primeira conta registrada no servidor vira admin
+// (isAdmin=true), como antes era a primeira conta criada no aparelho.
+// So o admin lista usuarios, redefine senha e apaga conta. Apagar nao
+// permite apagar a propria conta nem outra conta admin.
+//
+// Diaria: paidUntil (fim da diaria paga, em ms) fica na conta, para a
+// diaria paga valer na conta em qualquer aparelho — antes ela so valia
+// no aparelho onde foi paga. O app grava via POST /auth/fee depois de
+// confirmar o Pix pago (mesma validacao de antes, no aparelho).
+// ---------------------------------------------------------------------------
+
+const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // sessao vale 30 dias
+
+let authStore = { version: 1, accounts: [], tokens: [] };
+
+function loadAuthStore() {
+  try {
+    if (!fs.existsSync(ACCOUNTS_FILE)) return;
+    const raw = fs.readFileSync(ACCOUNTS_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (data && Array.isArray(data.accounts) && Array.isArray(data.tokens)) {
+      authStore = data;
+      pruneTokens();
+    } else {
+      console.log("accounts.json invalido (formato inesperado); comecando vazio.");
+    }
+  } catch (err) {
+    console.log("nao foi possivel ler accounts.json (" + err.message + "); comecando vazio.");
+  }
+}
+
+function saveAuthStore() {
+  try {
+    const tmp = ACCOUNTS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(authStore), "utf8");
+    fs.renameSync(tmp, ACCOUNTS_FILE);
+  } catch (err) {
+    console.log("nao foi possivel gravar accounts.json: " + err.message);
+  }
+}
+
+function normalizePhone(v) {
+  if (typeof v !== "string") return "";
+  return v.replace(/\D/g, "");
+}
+
+function hashPassword(password, salt) {
+  const hash = crypto.scryptSync(password, salt, 64);
+  return salt + ":" + hash.toString("hex");
+}
+
+function newPasswordHash(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return hashPassword(password, salt);
+}
+
+function checkPassword(password, stored) {
+  if (typeof stored !== "string") return false;
+  const parts = stored.split(":");
+  if (parts.length !== 2) return false;
+  const expected = Buffer.from(parts[1], "hex");
+  const actual = crypto.scryptSync(password, parts[0], 64);
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
+}
+
+function accountPublic(a) {
+  return {
+    id: a.id,
+    name: a.name,
+    phone: a.phone,
+    role: a.role,
+    photo: a.photo || "",
+    plate: a.plate || "",
+    bike: a.bike || "",
+    shopAddr: a.shopAddr || "",
+    paidUntil: a.paidUntil || 0,
+    isAdmin: !!a.isAdmin,
+    createdAt: a.createdAt
+  };
+}
+
+function newAccountId() {
+  return "acc_" + Date.now().toString(36) + "_" + crypto.randomBytes(6).toString("hex");
+}
+
+function findAccountByPhone(phone) {
+  const p = normalizePhone(phone);
+  if (!p) return null;
+  return authStore.accounts.find((a) => a.phone === p) || null;
+}
+
+function findAccountById(id) {
+  return authStore.accounts.find((a) => a.id === id) || null;
+}
+
+function pruneTokens() {
+  const now = Date.now();
+  authStore.tokens = authStore.tokens.filter((t) => t.expiresAt > now);
+}
+
+function issueToken(accountId) {
+  pruneTokens();
+  const token = crypto.randomBytes(32).toString("hex");
+  authStore.tokens.push({
+    token,
+    accountId,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + TOKEN_TTL_MS
+  });
+  saveAuthStore();
+  return token;
+}
+
+function accountFromToken(req) {
+  const h = req.headers.authorization || "";
+  const m = /^Bearer\s+(.+)$/.exec(h);
+  if (!m) return null;
+  const token = m[1].trim();
+  pruneTokens();
+  const rec = authStore.tokens.find((t) => t.token === token);
+  if (!rec || rec.expiresAt <= Date.now()) return null;
+  return findAccountById(rec.accountId);
+}
+
+function requireAuth(req, res, next) {
+  const account = accountFromToken(req);
+  if (!account) {
+    return res.status(401).json({ error: "unauthorized", message: "valid session token is required." });
+  }
+  req.account = account;
+  return next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.account || !req.account.isAdmin) {
+    return res.status(403).json({ error: "admin_only", message: "only the admin can do this." });
+  }
+  return next();
+}
+
+function revokeTokens(accountId) {
+  authStore.tokens = authStore.tokens.filter((t) => t.accountId !== accountId);
+}
+
+// Limite simples contra tentativa de senha em sequencia: 10 falhas por
+// telefone em 10 minutos -> 429. Em memoria; reinicio zera o contador.
+const loginFailures = new Map();
+function loginBlocked(phone) {
+  const rec = loginFailures.get(phone);
+  if (!rec) return false;
+  if (Date.now() - rec.firstAt > 10 * 60 * 1000) {
+    loginFailures.delete(phone);
+    return false;
+  }
+  return rec.count >= 10;
+}
+function loginFailed(phone) {
+  const rec = loginFailures.get(phone) || { count: 0, firstAt: Date.now() };
+  rec.count += 1;
+  loginFailures.set(phone, rec);
+}
+function loginSucceeded(phone) {
+  loginFailures.delete(phone);
+}
+
+// POST /auth/register — cria a conta no servidor. Corpo: { name, phone,
+// password, role ("passageiro"|"mototaxi"|"comercio"), photo?, plate?,
+// bike?, shopAddr? }. A primeira conta registrada vira admin. Se o
+// telefone ja existir E a senha conferir, devolve a conta existente
+// (migracao idempotente: o app reenvia a conta local sem duplicar).
+app.post("/auth/register", (req, res) => {
+  const body = req.body || {};
+  const name = cleanStr(body.name, 80);
+  const phone = normalizePhone(body.phone);
+  const password = typeof body.password === "string" ? body.password : "";
+  const role = cleanStr(body.role, 20);
+
+  if (!name) {
+    return res.status(400).json({ error: "missing_name", message: "name is required." });
+  }
+  if (!phone || phone.length < 8 || phone.length > 13) {
+    return res.status(400).json({ error: "invalid_phone", message: "phone must have 8 to 13 digits." });
+  }
+  if (password.length < 4) {
+    return res.status(400).json({ error: "invalid_password", message: "password must have at least 4 characters." });
+  }
+  if (role !== "passageiro" && role !== "mototaxi" && role !== "comercio") {
+    return res.status(400).json({ error: "invalid_role", message: 'role must be "passageiro", "mototaxi" or "comercio".' });
+  }
+
+  const existing = findAccountByPhone(phone);
+  if (existing) {
+    if (checkPassword(password, existing.passHash)) {
+      // Migracao repetida: a conta ja esta no servidor, so entra.
+      const token = issueToken(existing.id);
+      return res.json({ ok: true, migrated: true, token, account: accountPublic(existing) });
+    }
+    return res.status(409).json({ error: "phone_exists", message: "this phone is already registered." });
+  }
+
+  const isAdmin = authStore.accounts.length === 0;
+  const account = {
+    id: newAccountId(),
+    name,
+    phone,
+    passHash: newPasswordHash(password),
+    role,
+    photo: cleanStr(body.photo, 200000),
+    plate: cleanStr(body.plate, 16),
+    bike: cleanStr(body.bike, 80),
+    shopAddr: cleanStr(body.shopAddr, 300),
+    paidUntil: 0,
+    isAdmin,
+    createdAt: Date.now()
+  };
+  authStore.accounts.push(account);
+  saveAuthStore();
+  const token = issueToken(account.id);
+  return res.status(201).json({ ok: true, token, account: accountPublic(account) });
+});
+
+// POST /auth/login — entra com telefone + senha. Erros distintos para o
+// app saber o que fazer: account_not_found (conta nao existe no
+// servidor — o app tenta a migracao automatica) e invalid_password.
+app.post("/auth/login", (req, res) => {
+  const body = req.body || {};
+  const phone = normalizePhone(body.phone);
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!phone) {
+    return res.status(400).json({ error: "invalid_phone", message: "phone is required." });
+  }
+  if (loginBlocked(phone)) {
+    return res.status(429).json({ error: "too_many_attempts", message: "too many failed attempts; try again in a few minutes." });
+  }
+  const account = findAccountByPhone(phone);
+  if (!account) {
+    return res.status(404).json({ error: "account_not_found", message: "no account for this phone." });
+  }
+  if (!checkPassword(password, account.passHash)) {
+    loginFailed(phone);
+    return res.status(401).json({ error: "invalid_password", message: "wrong password." });
+  }
+  loginSucceeded(phone);
+  const token = issueToken(account.id);
+  return res.json({ ok: true, token, account: accountPublic(account) });
+});
+
+// GET /auth/me — quem esta logado com este token.
+app.get("/auth/me", requireAuth, (req, res) => {
+  return res.json({ ok: true, account: accountPublic(req.account) });
+});
+
+// POST /auth/logout — encerra a sessao (apaga o token).
+app.post("/auth/logout", requireAuth, (req, res) => {
+  const h = req.headers.authorization || "";
+  const m = /^Bearer\s+(.+)$/.exec(h);
+  if (m) {
+    authStore.tokens = authStore.tokens.filter((t) => t.token !== m[1].trim());
+    saveAuthStore();
+  }
+  return res.json({ ok: true });
+});
+
+// POST /auth/change-password — o proprio usuario troca a senha.
+app.post("/auth/change-password", requireAuth, (req, res) => {
+  const body = req.body || {};
+  const current = typeof body.currentPassword === "string" ? body.currentPassword : "";
+  const next = typeof body.newPassword === "string" ? body.newPassword : "";
+  if (!checkPassword(current, req.account.passHash)) {
+    return res.status(401).json({ error: "invalid_password", message: "current password is wrong." });
+  }
+  if (next.length < 4) {
+    return res.status(400).json({ error: "invalid_password", message: "new password must have at least 4 characters." });
+  }
+  req.account.passHash = newPasswordHash(next);
+  revokeTokens(req.account.id);
+  saveAuthStore();
+  const token = issueToken(req.account.id);
+  return res.json({ ok: true, token, account: accountPublic(req.account) });
+});
+
+// POST /auth/fee — registra a diaria paga na conta (para valer em
+// qualquer aparelho). Corpo: { paidUntil } (ms). So aumenta, nunca
+// diminui. O app chama depois de confirmar o Pix pago.
+app.post("/auth/fee", requireAuth, (req, res) => {
+  const body = req.body || {};
+  const paidUntil = Number(body.paidUntil);
+  if (!Number.isFinite(paidUntil) || paidUntil <= Date.now()) {
+    return res.status(400).json({ error: "invalid_paidUntil", message: "paidUntil must be a future timestamp." });
+  }
+  if (paidUntil > (req.account.paidUntil || 0)) {
+    req.account.paidUntil = paidUntil;
+    saveAuthStore();
+  }
+  return res.json({ ok: true, account: accountPublic(req.account) });
+});
+
+// GET /auth/users — admin lista as contas (para buscar pelo nome,
+// redefinir senha e apagar conta). Nunca devolve o hash.
+app.get("/auth/users", requireAuth, requireAdmin, (req, res) => {
+  const users = authStore.accounts.map(accountPublic);
+  users.sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+  return res.json({ ok: true, users, count: users.length });
+});
+
+// POST /auth/reset-password — o admin redefine a senha de um usuario.
+// Corpo: { accountId } ou { phone }, e { newPassword }. Apaga as
+// sessoes do usuario (ele entra de novo com a senha nova).
+app.post("/auth/reset-password", requireAuth, requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+  if (newPassword.length < 4) {
+    return res.status(400).json({ error: "invalid_password", message: "new password must have at least 4 characters." });
+  }
+  let target = null;
+  if (typeof body.accountId === "string" && body.accountId) {
+    target = findAccountById(body.accountId);
+  }
+  if (!target && body.phone) target = findAccountByPhone(body.phone);
+  if (!target) {
+    return res.status(404).json({ error: "account_not_found", message: "account not found." });
+  }
+  target.passHash = newPasswordHash(newPassword);
+  revokeTokens(target.id);
+  saveAuthStore();
+  return res.json({ ok: true, account: accountPublic(target) });
+});
+
+// DELETE /auth/users/:id — o admin apaga uma conta. Nao apaga a
+// propria conta nem outra conta admin (mesma regra de antes). Apagar
+// revoga os tokens: a conta apagada perde o acesso em TODOS os
+// aparelhos (o token dela deixa de valer no servidor).
+app.delete("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
+  const target = findAccountById(String(req.params.id || ""));
+  if (!target) {
+    return res.status(404).json({ error: "account_not_found", message: "account not found." });
+  }
+  if (target.id === req.account.id) {
+    return res.status(403).json({ error: "cannot_delete_self", message: "the admin cannot delete her own account." });
+  }
+  if (target.isAdmin) {
+    return res.status(403).json({ error: "cannot_delete_admin", message: "an admin account cannot be deleted." });
+  }
+  authStore.accounts = authStore.accounts.filter((a) => a.id !== target.id);
+  revokeTokens(target.id);
+  saveAuthStore();
+  return res.json({ ok: true, deleted: target.id });
+});
+
+loadAuthStore();
 
 app.listen(PORT, () => {
   console.log("moto-taxi-backend listening on port " + PORT);

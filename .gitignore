@@ -1,2 +1,4 @@
 node_modules/
 .env
+accounts.json
+accounts.json.tmp

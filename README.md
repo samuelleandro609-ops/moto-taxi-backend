@@ -115,6 +115,87 @@ Expiração: presença sem heartbeat há mais de ~15 s some da lista;
 chamado pendente expira em 30 min, aceito em 60 min, concluído fica
 visível por 10 min.
 
+## Contas no servidor (/auth)
+
+Antes a conta só existia no `localStorage` de cada aparelho: a conta
+criada no celular não existia no PC e o login no PC dizia "incorreto"
+mesmo com a senha certa. Agora registro e login são no servidor — o
+mesmo telefone + senha entra em qualquer aparelho; o aparelho guarda
+só o token da sessão (nunca a senha).
+
+**Senhas:** hash `scrypt` com salt aleatório (crypto nativo, sem
+dependência nova). Nada de texto claro em arquivo, log ou resposta.
+
+**Persistência:** `accounts.json` ao lado do `server.js`, escrita
+atômica (grava temporário e renomeia). Lido na inicialização. No
+Render Free o disco é efêmero — se o serviço reiniciar, o arquivo
+some e as contas voltam pela migração automática do app (ele reenvia
+a conta local quando o servidor não a conhece). No VPS o disco
+persiste e nada se perde. O Postgres gratuito do Render **não** serve:
+ele expira e é apagado depois de ~30 dias.
+
+**Admin:** a primeira conta registrada no servidor vira admin
+(`isAdmin: true`). Só o admin lista usuários, redefine senha e apaga
+conta. Apagar não permite apagar a própria conta nem outra admin — e
+revoga os tokens da conta apagada, então ela perde o acesso em todos
+os aparelhos.
+
+**Sessão:** token aleatório (Bearer) válido por 30 dias.
+
+### POST /auth/register
+
+Cria a conta. Corpo: `{ "name", "phone", "password", "role":
+"passageiro" | "mototaxi" | "comercio", "photo"?, "plate"?, "bike"?,
+"shopAddr"? }`. Resposta (201): `{ "ok": true, "token", "account": {
+"id", "name", "phone", "role", "photo", "plate", "bike", "shopAddr",
+"paidUntil", "isAdmin", "createdAt" } }`. Telefone já registrado com
+a mesma senha devolve a conta existente (migração idempotente);
+com senha diferente, **409** `phone_exists`.
+
+### POST /auth/login
+
+Entra com `{ "phone", "password" }`. Resposta: `{ "ok": true,
+"token", "account" }`. Conta inexistente: **404**
+`account_not_found` (o app tenta a migração automática). Senha
+errada: **401** `invalid_password`. 10 falhas em 10 min por telefone:
+**429** `too_many_attempts`.
+
+### GET /auth/me
+
+Quem está logado. Header: `Authorization: Bearer <token>`. Sem
+token válido: **401** `unauthorized`.
+
+### POST /auth/logout
+
+Encerra a sessão (apaga o token). Header: `Authorization: Bearer
+<token>`.
+
+### POST /auth/change-password
+
+O próprio usuário troca a senha. Corpo: `{ "currentPassword",
+"newPassword" }`. Apaga as outras sessões e devolve um token novo.
+
+### POST /auth/fee
+
+Registra a diária paga na conta, para valer em qualquer aparelho.
+Corpo: `{ "paidUntil" }` (timestamp em ms, no futuro). Só aumenta,
+nunca diminui. O app chama depois de confirmar o Pix pago.
+
+### GET /auth/users
+
+Admin lista as contas (buscar pelo nome, redefinir senha, apagar
+conta). Não-admin: **403** `admin_only`.
+
+### POST /auth/reset-password
+
+O admin redefine a senha de um usuário. Corpo: `{ "accountId" }` ou
+`{ "phone" }`, e `{ "newPassword" }`. Apaga as sessões do usuário.
+
+### DELETE /auth/users/:id
+
+O admin apaga uma conta. Não apaga a própria conta nem outra admin
+(**403**). Revoga os tokens da conta apagada.
+
 ## Endpoints de valores
 
 ### GET /settings
@@ -135,7 +216,7 @@ guardado; um POST mais antigo não sobrescreve o mais novo
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.2.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.3.0" }`.
 
 ### POST /create-pix
 
