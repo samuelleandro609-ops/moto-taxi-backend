@@ -13,11 +13,113 @@ Não há saldo nem saque dentro do app.
 O endpoint `/create-pix` é genérico (aceita qualquer valor e descrição),
 mas o único uso dele hoje é a diária.
 
-## Endpoints
+## Sincronização entre aparelhos (presença e chamados)
+
+O site é estático: cada aparelho só vê o próprio `localStorage`. Estes
+endpoints guardam em **memória** quem está online e quais chamados estão
+pendentes, para que qualquer aparelho veja o mesmo estado — nos **dois
+sentidos**: um celular online aparece no PC e um PC online aparece no
+celular; um chamado feito em qualquer aparelho chega ao mototáxi em
+qualquer aparelho. Sem banco de dados: se o serviço reiniciar (o plano
+Free do Render dorme após ~15 min sem acesso), presença e chamados
+somem e os aparelhos reenviam o heartbeat / recriam o chamado.
+
+### POST /presence
+
+Heartbeat do mototáxi — o app envia a cada poucos segundos enquanto ele
+está online. Corpo:
+
+```json
+{
+  "key": "conta-telefone-do-mototaxi",
+  "name": "João",
+  "photo": "data:image/jpeg;base64,...",
+  "bike": "Honda CG 160",
+  "plate": "ABC1D23",
+  "lat": -7.4744,
+  "lng": -35.3436,
+  "online": true
+}
+```
+
+Resposta: `{ "ok": true, "online": true, "key": "..." }`. Com
+`"online": false` o moto sai da lista na hora. A foto é opcional nos
+heartbeats seguintes — sem ela, o servidor mantém a última foto.
+
+### GET /presence
+
+Motos online agora — só as com heartbeat nos últimos **15 segundos**.
+Resposta:
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "drivers": [
+    { "key": "...", "name": "João", "photo": "data:image/jpeg;base64,...", "bike": "Honda CG 160", "plate": "ABC1D23", "lat": -7.4744, "lng": -35.3436, "updatedAt": 1792450000000 }
+  ]
+}
+```
+
+### POST /calls
+
+Cria um chamado. `targetKey: null` = para qualquer moto;
+com `targetKey` o chamado é dirigido a um moto só (o "Chamar" ao
+clicar no moto no mapa). Corpo:
+
+```json
+{
+  "callerName": "Maria",
+  "callerPhone": "81999990000",
+  "targetKey": null,
+  "targetName": null,
+  "type": "corrida",
+  "pickup": "Rua da Matriz, 100",
+  "destination": "Rua do Comércio, 50",
+  "amount": 8
+}
+```
+
+`type` é `"corrida"` ou `"entrega"`. Resposta (201): `{ "ok": true, "call": { "id": "call_...", "status": "pending", "phase": "aguardando", ... } }`.
+
+### GET /calls
+
+Chamados pendentes (padrão). `?status=all` lista todos;
+`?mine=<key>` lista os aceitos por aquele mototáxi (para ele
+acompanhar o chamado ativo dele em qualquer aparelho). Resposta:
+`{ "ok": true, "count": 1, "calls": [ ... ] }`.
+
+### GET /calls/:id
+
+Detalhe de um chamado. 404 se não existir.
+
+### POST /calls/:id/accept
+
+Um mototáxi aceita o chamado. Corpo: `{ "key": "...", "name": "João" }`.
+Só o primeiro aceita — os outros recebem **409** e o chamado some da
+lista de pendentes deles. Se o chamado foi dirigido a um moto
+(`targetKey`), só ele pode aceitar (**403** para os demais).
+
+### POST /calls/:id/phase
+
+Atualiza a fase do chamado. Corpo: `{ "phase": "coleta_confirmada" }`
+(ex.: `"a_caminho_coleta"`, `"coleta_confirmada"`,
+`"a_caminho_entrega"`). Não aceita fase em chamado já concluído (409).
+
+### POST /calls/:id/complete
+
+Conclui o chamado. Corpo: `{ "key": "..." }`. Só o mototáxi que
+aceitou pode concluir (403 para outro).
+
+Expiração: presença sem heartbeat há mais de ~15 s some da lista;
+chamado pendente expira em 30 min, aceito em 60 min, concluído fica
+visível por 10 min.
+
+## Endpoints Pix
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.0.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.1.0" }`.
 
 ### POST /create-pix
 

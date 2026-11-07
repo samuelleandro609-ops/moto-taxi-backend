@@ -12,6 +12,14 @@
  * O token de acesso do Mercado Pago vem SOMENTE da variavel de ambiente
  * MP_ACCESS_TOKEN. Nunca coloque o token no codigo, em arquivo ou em log.
  * Sem MP_ACCESS_TOKEN, /create-pix responde 503 e nunca gera QR falso.
+ *
+ * Presenca e chamados (/presence, /calls): o site e estatico e cada
+ * aparelho so ve o proprio localStorage. Estes endpoints guardam em
+ * MEMORIA quem esta online e quais chamados estao pendentes, para que um
+ * celular e um PC vejam a mesma coisa. Nao ha banco de dados: se o
+ * servico reiniciar (Render Free dorme), presenca e chamados somem e os
+ * aparelhos reenviam o heartbeat / recriam o chamado. Nada aqui usa
+ * chave ou token.
  */
 
 const express = require("express");
@@ -100,7 +108,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.0.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.1.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -216,6 +224,328 @@ app.get("/payment/:id", async (req, res) => {
         : "Could not reach Mercado Pago.";
     return res.status(502).json({ error: "mercadopago_unreachable", message: msg });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Presenca e chamados (sincronizacao entre aparelhos, nos DOIS sentidos)
+//
+// O site e estatico: cada aparelho so ve o proprio localStorage. Estes
+// endpoints guardam em MEMORIA quem esta online e quais chamados estao
+// pendentes, para que qualquer aparelho veja o mesmo estado — um celular
+// online aparece no PC e um PC online aparece no celular; um chamado
+// feito em qualquer aparelho chega ao mototaxi em qualquer aparelho.
+// Nao ha banco de dados: se o servico reiniciar (Render Free dorme),
+// presenca e chamados somem e os aparelhos reenviam o heartbeat /
+// recriam o chamado. Nada aqui usa chave ou token.
+// ---------------------------------------------------------------------------
+
+const PRESENCE_TTL_MS = 15000; // heartbeat recente: ultimos 15 s
+const CALL_PENDING_TTL_MS = 30 * 60 * 1000; // chamado pendente expira em 30 min
+const CALL_ACTIVE_TTL_MS = 60 * 60 * 1000; // aceito expira em 60 min
+const CALL_DONE_TTL_MS = 10 * 60 * 1000; // concluido fica visivel por 10 min
+
+// key (chave da conta) -> { key, name, photo, bike, plate, lat, lng, online, updatedAt }
+const presence = new Map();
+// id -> { id, callerName, callerPhone, targetKey, targetName, type, pickup,
+//         destination, amount, status, phase, acceptedBy, acceptedName,
+//         createdAt, updatedAt, completedAt }
+const calls = new Map();
+let callSeq = 0;
+
+function cleanStr(v, max) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function freshPresence(p) {
+  return Date.now() - p.updatedAt <= PRESENCE_TTL_MS;
+}
+
+function callPublic(c) {
+  return {
+    id: c.id,
+    callerName: c.callerName,
+    callerPhone: c.callerPhone,
+    targetKey: c.targetKey,
+    targetName: c.targetName,
+    type: c.type,
+    pickup: c.pickup,
+    destination: c.destination,
+    amount: c.amount,
+    status: c.status,
+    phase: c.phase,
+    acceptedBy: c.acceptedBy,
+    acceptedName: c.acceptedName,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    completedAt: c.completedAt
+  };
+}
+
+function pruneStores() {
+  const now = Date.now();
+  for (const [key, p] of presence) {
+    if (now - p.updatedAt > PRESENCE_TTL_MS) presence.delete(key);
+  }
+  for (const [id, c] of calls) {
+    const ttl =
+      c.status === "pending"
+        ? CALL_PENDING_TTL_MS
+        : c.status === "accepted"
+          ? CALL_ACTIVE_TTL_MS
+          : CALL_DONE_TTL_MS;
+    if (now - c.updatedAt > ttl) calls.delete(id);
+  }
+}
+setInterval(pruneStores, 10000).unref();
+
+// POST /presence — heartbeat do mototaxi (chamado a cada poucos segundos
+// enquanto ele esta online). Corpo: { key, name, photo, bike, plate, lat,
+// lng, online }. online=false tira o moto da lista na hora. Se photo
+// vier vazia, mantem a foto do heartbeat anterior.
+app.post("/presence", (req, res) => {
+  const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  if (!key) {
+    return res
+      .status(400)
+      .json({ error: "missing_key", message: "key is required." });
+  }
+  if (body.online !== true) {
+    presence.delete(key);
+    return res.json({ ok: true, online: false, key });
+  }
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return res
+      .status(400)
+      .json({ error: "invalid_location", message: "lat/lng are required." });
+  }
+  const prev = presence.get(key);
+  const photo = cleanStr(body.photo, 200000);
+  presence.set(key, {
+    key,
+    name: cleanStr(body.name, 80),
+    photo: photo || (prev ? prev.photo : ""),
+    bike: cleanStr(body.bike, 80),
+    plate: cleanStr(body.plate, 16),
+    lat,
+    lng,
+    online: true,
+    updatedAt: Date.now()
+  });
+  return res.json({ ok: true, online: true, key });
+});
+
+// GET /presence — motos online agora (so as com heartbeat nos ultimos 15 s).
+app.get("/presence", (req, res) => {
+  pruneStores();
+  const drivers = [];
+  for (const p of presence.values()) {
+    if (!freshPresence(p)) continue;
+    drivers.push({
+      key: p.key,
+      name: p.name,
+      photo: p.photo,
+      bike: p.bike,
+      plate: p.plate,
+      lat: p.lat,
+      lng: p.lng,
+      updatedAt: p.updatedAt
+    });
+  }
+  return res.json({ ok: true, drivers, count: drivers.length });
+});
+
+// POST /calls — cria um chamado. Corpo: { callerName, callerPhone,
+// targetKey (null = para qualquer moto), targetName, type
+// ("corrida"|"entrega"), pickup, destination, amount }.
+app.post("/calls", (req, res) => {
+  const body = req.body || {};
+  const type = cleanStr(body.type, 20);
+  if (type !== "corrida" && type !== "entrega") {
+    return res.status(400).json({
+      error: "invalid_type",
+      message: 'type must be "corrida" or "entrega".'
+    });
+  }
+  const pickup = cleanStr(body.pickup, 300);
+  const destination = cleanStr(body.destination, 300);
+  if (!pickup || !destination) {
+    return res.status(400).json({
+      error: "missing_address",
+      message: "pickup and destination are required."
+    });
+  }
+  const amount = Number(body.amount);
+  if (!Number.isFinite(amount) || amount < 0) {
+    return res.status(400).json({
+      error: "invalid_amount",
+      message: "amount must be a number >= 0."
+    });
+  }
+  const id =
+    "call_" +
+    Date.now().toString(36) +
+    "_" +
+    (callSeq++).toString(36) +
+    Math.floor(Math.random() * 1296).toString(36);
+  const now = Date.now();
+  const call = {
+    id,
+    callerName: cleanStr(body.callerName, 80),
+    callerPhone: cleanStr(body.callerPhone, 32),
+    targetKey: cleanStr(body.targetKey, 128) || null,
+    targetName: cleanStr(body.targetName, 80) || null,
+    type,
+    pickup,
+    destination,
+    amount,
+    status: "pending",
+    phase: "aguardando",
+    acceptedBy: null,
+    acceptedName: null,
+    createdAt: now,
+    updatedAt: now,
+    completedAt: null
+  };
+  calls.set(id, call);
+  return res.status(201).json({ ok: true, call: callPublic(call) });
+});
+
+// GET /calls — chamados pendentes (padrao). ?status=all lista todos;
+// ?mine=<key> lista os aceitos por aquele mototaxi (para ele acompanhar
+// o chamado ativo dele em qualquer aparelho).
+app.get("/calls", (req, res) => {
+  pruneStores();
+  const status = cleanStr(req.query.status, 20) || "pending";
+  const mine = cleanStr(req.query.mine, 128);
+  const list = [];
+  for (const c of calls.values()) {
+    if (mine) {
+      if (c.acceptedBy !== mine) continue;
+    } else if (status !== "all" && c.status !== status) {
+      continue;
+    }
+    list.push(callPublic(c));
+  }
+  list.sort((a, b) => a.createdAt - b.createdAt);
+  return res.json({ ok: true, calls: list, count: list.length });
+});
+
+// GET /calls/:id — detalhe de um chamado.
+app.get("/calls/:id", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  return res.json({ ok: true, call: callPublic(c) });
+});
+
+// POST /calls/:id/accept — um mototaxi aceita o chamado. Corpo:
+// { key, name }. So o primeiro aceita (os outros recebem 409 e o
+// chamado some da lista de pendentes deles). Se o chamado foi dirigido
+// a um moto (targetKey), so ele pode aceitar (403 para os demais).
+app.post("/calls/:id/accept", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status !== "pending") {
+    return res.status(409).json({
+      error: "call_not_pending",
+      message: "call is already " + c.status + ".",
+      call: callPublic(c)
+    });
+  }
+  const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  if (!key) {
+    return res
+      .status(400)
+      .json({ error: "missing_key", message: "key is required." });
+  }
+  if (c.targetKey && c.targetKey !== key) {
+    return res.status(403).json({
+      error: "not_targeted_driver",
+      message: "this call is directed to another driver."
+    });
+  }
+  c.status = "accepted";
+  c.phase = "a_caminho_coleta";
+  c.acceptedBy = key;
+  c.acceptedName = cleanStr(body.name, 80);
+  c.updatedAt = Date.now();
+  return res.json({ ok: true, call: callPublic(c) });
+});
+
+// POST /calls/:id/phase — atualiza a fase do chamado. Corpo:
+// { phase } — ex.: "coleta_confirmada", "a_caminho_entrega".
+// Nao aceita fase em chamado ja concluido (409).
+app.post("/calls/:id/phase", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status === "completed") {
+    return res.status(409).json({
+      error: "call_completed",
+      message: "call is already completed.",
+      call: callPublic(c)
+    });
+  }
+  const body = req.body || {};
+  const phase = cleanStr(body.phase, 40);
+  if (!phase) {
+    return res
+      .status(400)
+      .json({ error: "missing_phase", message: "phase is required." });
+  }
+  c.phase = phase;
+  c.updatedAt = Date.now();
+  return res.json({ ok: true, call: callPublic(c) });
+});
+
+// POST /calls/:id/complete — conclui o chamado. Corpo: { key }.
+// So o mototaxi que aceitou pode concluir (403 para outro).
+app.post("/calls/:id/complete", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status === "completed") {
+    return res.json({ ok: true, call: callPublic(c) });
+  }
+  const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  if (c.acceptedBy && key && c.acceptedBy !== key) {
+    return res.status(403).json({
+      error: "not_accepted_driver",
+      message: "only the driver who accepted can complete this call."
+    });
+  }
+  c.status = "completed";
+  c.phase = "concluido";
+  c.completedAt = Date.now();
+  c.updatedAt = Date.now();
+  return res.json({ ok: true, call: callPublic(c) });
 });
 
 app.listen(PORT, () => {
