@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: moto-taxi-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MP_ACCESS_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGIN
+        value: https://moto-taxi-timbauba.onrender.com
