@@ -111,6 +111,30 @@ Atualiza a fase do chamado. Corpo: `{ "phase": "coleta_confirmada" }`
 Conclui o chamado. Corpo: `{ "key": "..." }`. Só o mototáxi que
 aceitou pode concluir (403 para outro).
 
+### Voz ao vivo — sinalização WebRTC (push-to-talk)
+
+Durante a rota ativa, o mototáxi segura um botão para falar e o
+cliente ouve ao vivo (walkie-talkie, só moto → cliente). O servidor
+só faz a **sinalização**: guarda e entrega as mensagens do "combinado"
+da ligação (oferta SDP, resposta SDP e candidatos ICE). O áudio vai
+direto de navegador para navegador (peer-to-peer via WebRTC) e **não**
+passa pelo servidor. O botão só existe durante a rota ativa; quando
+ela acaba, as duas pontas fecham a conexão.
+
+`POST /calls/:id/signal` — uma ponta envia um sinal para a outra.
+Corpo: `{ "from": "driver"|"caller", "key": "<chave da conta>",
+"type": "offer"|"answer"|"ice"|"bye", "data": {...} }`. Só vale em
+chamado aceito (409 fora da rota ativa); só as duas pontas do chamado
+podem trocar sinais (403 para outra chave). `offer` é a oferta SDP do
+mototáxi, `answer` a resposta SDP do cliente, `ice` um candidato ICE
+de qualquer ponta e `bye` avisa que a ponta fechou a conexão.
+
+`GET /calls/:id/signal?for=driver|caller&key=<chave>&since=<seq>` —
+uma ponta busca os sinais novos para ela. Devolve só as mensagens da
+outra ponta com `seq` maior que `since`, em ordem, mais `lastSeq`.
+Cada ponta guarda o último `seq` recebido e pergunta de tempos em
+tempos (polling, como o resto do app).
+
 Expiração: presença sem heartbeat há mais de ~15 s some da lista;
 chamado pendente expira em 30 min, aceito em 60 min, concluído fica
 visível por 10 min.
@@ -216,7 +240,7 @@ guardado; um POST mais antigo não sobrescreve o mais novo
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.3.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.4.0" }`.
 
 ### POST /create-pix
 

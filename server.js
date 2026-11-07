@@ -39,6 +39,12 @@
  * persiste e nada se perde. O Postgres gratuito do Render NAO serve
  * aqui: ele expira e e apagado depois de ~30 dias, entao as contas
  * sumiriam sozinhas.
+ *
+ * Voz ao vivo (/calls/:id/signal): durante a rota ativa, o mototaxi
+ * segura um botao para falar e o cliente ouve ao vivo (walkie-talkie,
+ * so moto -> cliente). O servidor so faz a SINALIZACAO WebRTC (oferta
+ * SDP, resposta SDP e candidatos ICE); o audio vai direto de navegador
+ * para navegador, sem passar por aqui.
  */
 
 const express = require("express");
@@ -138,7 +144,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.3.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.4.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -419,7 +425,10 @@ function pruneStores() {
         : c.status === "accepted"
           ? CALL_ACTIVE_TTL_MS
           : CALL_DONE_TTL_MS;
-    if (now - c.updatedAt > ttl) calls.delete(id);
+    if (now - c.updatedAt > ttl) {
+      calls.delete(id);
+      signals.delete(id);
+    }
   }
 }
 setInterval(pruneStores, 10000).unref();
@@ -670,6 +679,161 @@ app.post("/calls/:id/complete", (req, res) => {
   c.completedAt = Date.now();
   c.updatedAt = Date.now();
   return res.json({ ok: true, call: callPublic(c) });
+});
+
+// ---------------------------------------------------------------------------
+// Voz ao vivo (push-to-talk, walkie-talkie) — sinalizacao WebRTC
+//
+// Durante uma corrida/entrega ativa, o mototaxi segura um botao para
+// falar e o cliente (passageiro ou comercio) ouve a voz dele ao vivo;
+// ao soltar, para. So um sentido: moto -> cliente. O audio vai DIRETO
+// de navegador para navegador (peer-to-peer via WebRTC); o servidor so
+// faz a SINALIZACAO, isto e, guarda e entrega as mensagens do
+// "combinado" da ligacao (oferta SDP, resposta SDP e candidatos ICE).
+// Nada de audio passa por aqui.
+//
+// Como o app ja faz polling (a cada ~5 s), a sinalizacao usa polling
+// tambem: cada ponta pergunta de tempos em tempos se chegou mensagem
+// nova para ela (GET /calls/:id/signal?for=...&since=...). O botao so
+// existe durante a rota ativa, entao a conexao e por chamado: quando
+// a rota acaba, as duas pontas fecham a conexao e a fila de sinais
+// daquele chamado e descartada junto com o chamado (no pruneStores).
+//
+// Regras:
+// - So vale em chamado "accepted" (rota ativa). Enviar sinal em
+//   chamado pendente/concluido -> 409.
+// - So as duas pontas do chamado podem trocar sinais: o mototaxi
+//   (key == call.acceptedBy) manda como "driver"; o cliente (conta
+//   cujo telefone bate com call.callerPhone) manda como "caller".
+// - Cada mensagem tem um numero de sequencia (seq) por chamado; o GET
+//   devolve so as mensagens para aquela ponta com seq > since.
+// - Fila em MEMORIA, como presenca e chamados; some no reinicio.
+// ---------------------------------------------------------------------------
+
+const SIGNAL_MAX_PER_CALL = 100;
+
+// id do chamado -> { seq, messages: [{ seq, from, type, data, at }] }
+const signals = new Map();
+
+function signalPublic(m) {
+  return { seq: m.seq, from: m.from, type: m.type, data: m.data, at: m.at };
+}
+
+// Confere se a chave pertence a ponta indicada daquele chamado.
+// driver: a chave da conta que aceitou o chamado. caller: a conta cujo
+// telefone (so digitos) bate com o telefone do chamado.
+function signalParty(call, side, key) {
+  if (!key) return false;
+  if (side === "driver") {
+    return !!call.acceptedBy && key === call.acceptedBy;
+  }
+  if (side === "caller") {
+    const acc = findAccountById(key);
+    if (!acc || !acc.phone) return false;
+    return normalizePhone(call.callerPhone) === acc.phone;
+  }
+  return false;
+}
+
+// POST /calls/:id/signal — uma ponta envia um sinal para a outra.
+// Corpo: { from: "driver"|"caller", key, type: "offer"|"answer"|"ice"|"bye",
+// data: {...} }. "offer" e a oferta SDP do mototaxi; "answer" e a
+// resposta SDP do cliente; "ice" e um candidato ICE de qualquer ponta;
+// "bye" avisa que a ponta fechou a conexao (fim da rota).
+app.post("/calls/:id/signal", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status !== "accepted") {
+    return res.status(409).json({
+      error: "call_not_active",
+      message: "voice signaling is only available while the call is accepted."
+    });
+  }
+  const body = req.body || {};
+  const from = cleanStr(body.from, 10);
+  if (from !== "driver" && from !== "caller") {
+    return res.status(400).json({
+      error: "invalid_from",
+      message: 'from must be "driver" or "caller".'
+    });
+  }
+  const key = cleanStr(body.key, 128);
+  if (!signalParty(c, from, key)) {
+    return res.status(403).json({
+      error: "not_call_party",
+      message: "this key does not belong to a party of this call."
+    });
+  }
+  const type = cleanStr(body.type, 10);
+  if (type !== "offer" && type !== "answer" && type !== "ice" && type !== "bye") {
+    return res.status(400).json({
+      error: "invalid_type",
+      message: 'type must be "offer", "answer", "ice" or "bye".'
+    });
+  }
+  const data = body.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return res.status(400).json({
+      error: "invalid_data",
+      message: "data must be an object."
+    });
+  }
+  let queue = signals.get(c.id);
+  if (!queue) {
+    queue = { seq: 0, messages: [] };
+    signals.set(c.id, queue);
+  }
+  queue.seq += 1;
+  queue.messages.push({
+    seq: queue.seq,
+    from,
+    type,
+    data,
+    at: Date.now()
+  });
+  // Fila limitada: descarta as mais antigas para nao crescer sem fim.
+  while (queue.messages.length > SIGNAL_MAX_PER_CALL) queue.messages.shift();
+  return res.status(201).json({ ok: true, seq: queue.seq });
+});
+
+// GET /calls/:id/signal — uma ponta busca os sinais novos para ela.
+// Query: for=driver|caller, key=<chave da conta>, since=<seq> (0 = tudo).
+// Devolve so as mensagens da OUTRA ponta com seq > since, em ordem.
+app.get("/calls/:id/signal", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  const side = cleanStr(req.query.for, 10);
+  if (side !== "driver" && side !== "caller") {
+    return res.status(400).json({
+      error: "invalid_for",
+      message: 'for must be "driver" or "caller".'
+    });
+  }
+  const key = cleanStr(req.query.key, 128);
+  if (!signalParty(c, side, key)) {
+    return res.status(403).json({
+      error: "not_call_party",
+      message: "this key does not belong to a party of this call."
+    });
+  }
+  const since = Number(req.query.since) || 0;
+  const queue = signals.get(c.id);
+  const lastSeq = queue ? queue.seq : 0;
+  const messages = [];
+  if (queue) {
+    for (const m of queue.messages) {
+      if (m.seq > since && m.from !== side) messages.push(signalPublic(m));
+    }
+  }
+  return res.json({ ok: true, messages, lastSeq });
 });
 
 // ---------------------------------------------------------------------------
