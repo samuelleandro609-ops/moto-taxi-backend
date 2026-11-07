@@ -115,11 +115,27 @@ Expiração: presença sem heartbeat há mais de ~15 s some da lista;
 chamado pendente expira em 30 min, aceito em 60 min, concluído fica
 visível por 10 min.
 
+## Endpoints de valores
+
+### GET /settings
+
+Valores atuais (corrida, entrega, diária) para todos os aparelhos.
+A Administração do site grava aqui e todos os aparelhos leem daqui,
+para o valor valer em todos os aparelhos e não só onde foi editado.
+Responde os valores com `settingsAt` (carimbo da alteração).
+
+### POST /settings
+
+A Administração grava os valores novos. Corpo com os valores e
+`settingsAt` (carimbo). Só vale se o carimbo for mais recente que o
+guardado; um POST mais antigo não sobrescreve o mais novo
+(`stale: true`). Padrões: corrida 8, entrega 7, diária 5.
+
 ## Endpoints Pix
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.1.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.2.0" }`.
 
 ### POST /create-pix
 

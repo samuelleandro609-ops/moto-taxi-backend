@@ -20,6 +20,10 @@
  * servico reiniciar (Render Free dorme), presenca e chamados somem e os
  * aparelhos reenviam o heartbeat / recriam o chamado. Nada aqui usa
  * chave ou token.
+ *
+ * Valores (/settings): a Administracao edita corrida, entrega e diaria;
+ * o servidor guarda em MEMORIA e todos os aparelhos leem daqui, para o
+ * valor valer em todos os aparelhos e nao so onde foi editado.
  */
 
 const express = require("express");
@@ -78,14 +82,22 @@ async function mpRequest(path, options) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
+    const headers = {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json"
+    };
+    // O Mercado Pago exige X-Idempotency-Key em POST /v1/payments: sem
+    // ele a API recusa com 502 "Header X-Idempotency-Key can't be null".
+    // Quem chama passa a chave (no /create-pix e o external_ref, unico
+    // por cobranca, entao uma repeticao nao cria outra cobranca).
+    if (options && options.idempotencyKey) {
+      headers["X-Idempotency-Key"] = String(options.idempotencyKey);
+    }
     const resp = await fetch(MP_API + path, {
       method: (options && options.method) || "GET",
       body: options && options.body ? options.body : undefined,
       signal: controller.signal,
-      headers: {
-        Authorization: "Bearer " + token,
-        "Content-Type": "application/json"
-      }
+      headers
     });
     const text = await resp.text();
     let data = null;
@@ -108,7 +120,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.1.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.2.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -150,6 +162,7 @@ app.post("/create-pix", async (req, res) => {
   try {
     const result = await mpRequest("", {
       method: "POST",
+      idempotencyKey: external_ref,
       body: JSON.stringify({
         transaction_amount: amount,
         description,
@@ -224,6 +237,99 @@ app.get("/payment/:id", async (req, res) => {
         : "Could not reach Mercado Pago.";
     return res.status(502).json({ error: "mercadopago_unreachable", message: msg });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Valores (corrida, entrega, diaria) — sincronizacao entre aparelhos
+//
+// A Administracao do site edita os valores; o site grava aqui (POST
+// /settings) e todos os aparelhos leem daqui (GET /settings, a cada
+// ~25 s). Antes nao havia rota no servidor e o valor so mudava no
+// aparelho onde foi editado (o mototaxi continuava vendo R$ 8).
+// Em MEMORIA, como presenca e chamados: se o servico reiniciar, volta
+// aos padroes (corrida 8, entrega 7, diaria 5) e a Administracao grava
+// de novo. settingsAt e o carimbo da alteracao: so vale o mais recente,
+// para um aparelho atrasado nao ressuscitar um valor antigo.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5 };
+let appSettings = { ...DEFAULT_SETTINGS, settingsAt: 0 };
+
+function pickNumber(body, keys) {
+  for (const k of keys) {
+    const v = body[k];
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+  }
+  return undefined;
+}
+
+function settingsPublic() {
+  const s = appSettings;
+  // Devolve todas as variacoes de nome que o site pode usar, no topo e
+  // aninhadas em "settings", para o aparelho achar os valores do jeito
+  // que ele espera.
+  return {
+    ok: true,
+    ride: s.ride,
+    delivery: s.delivery,
+    fee: s.fee,
+    ridePrice: s.ride,
+    deliveryPrice: s.delivery,
+    dailyFee: s.fee,
+    corrida: s.ride,
+    entrega: s.delivery,
+    diaria: s.fee,
+    settingsAt: s.settingsAt,
+    settings: {
+      ride: s.ride,
+      delivery: s.delivery,
+      fee: s.fee,
+      ridePrice: s.ride,
+      deliveryPrice: s.delivery,
+      dailyFee: s.fee,
+      corrida: s.ride,
+      entrega: s.delivery,
+      diaria: s.fee,
+      settingsAt: s.settingsAt
+    }
+  };
+}
+
+// GET /settings — valores atuais para todos os aparelhos.
+app.get("/settings", (req, res) => {
+  return res.json(settingsPublic());
+});
+
+// POST /settings — a Administracao grava os valores novos. Corpo com os
+// valores e settingsAt (carimbo). So vale se o carimbo for mais recente
+// que o guardado; um POST mais antigo nao sobrescreve o mais novo.
+app.post("/settings", (req, res) => {
+  const body = req.body || {};
+  const ride = pickNumber(body, ["ride", "ridePrice", "priceRide", "corrida", "ride_value"]);
+  const delivery = pickNumber(body, ["delivery", "deliveryPrice", "priceDelivery", "entrega", "delivery_value"]);
+  const fee = pickNumber(body, ["fee", "dailyFee", "diaria", "daily_fee", "daily", "fee_value"]);
+  const at = pickNumber(body, ["settingsAt", "updatedAt", "timestamp", "version"]);
+
+  if (ride === undefined && delivery === undefined && fee === undefined) {
+    return res.status(400).json({
+      error: "invalid_settings",
+      message: "at least one of ride, delivery or fee must be a number >= 0."
+    });
+  }
+  const incomingAt = typeof at === "number" ? at : Date.now();
+  if (incomingAt < appSettings.settingsAt) {
+    // Carimbo mais antigo que o guardado: nao sobrescreve.
+    return res.json({ ok: true, stale: true, ...settingsPublic() });
+  }
+  if (ride !== undefined) appSettings.ride = ride;
+  if (delivery !== undefined) appSettings.delivery = delivery;
+  if (fee !== undefined) appSettings.fee = fee;
+  appSettings.settingsAt = incomingAt;
+  return res.json({ ok: true, ...settingsPublic() });
 });
 
 // ---------------------------------------------------------------------------
