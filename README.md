@@ -261,8 +261,12 @@ O próprio usuário troca a senha. Corpo: `{ "currentPassword",
 ### POST /auth/fee
 
 Registra a diária paga na conta, para valer em qualquer aparelho.
-Corpo: `{ "paidUntil" }` (timestamp em ms, no futuro). Só aumenta,
-nunca diminui. O app chama depois de confirmar o Pix pago.
+O `paidUntil` é calculado **no servidor**: agora + `feeDays` × 24 h
+(v1.7.0 — antes o app mandava `paidUntil` de 24 h fixo). **Um
+pagamento do valor da diária vale por `feeDays` dias.** Só aumenta,
+nunca diminui. O app chama depois de confirmar o Pix pago; o corpo
+não precisa de nada (um `paidUntil` mandado pelo app é ignorado).
+A conta da dona (`feeExempt`) e o modo gratuito não passam por aqui.
 
 ### GET /auth/users
 
@@ -283,23 +287,34 @@ O admin apaga uma conta. Não apaga a própria conta nem outra admin
 
 ### GET /settings
 
-Valores atuais (corrida, entrega, diária) para todos os aparelhos.
-A Administração do site grava aqui e todos os aparelhos leem daqui,
-para o valor valer em todos os aparelhos e não só onde foi editado.
-Responde os valores com `settingsAt` (carimbo da alteração).
+Valores atuais (corrida, entrega, diária e dias de validade da
+diária) para todos os aparelhos. A Administração do site grava aqui
+e todos os aparelhos leem daqui, para o valor valer em todos os
+aparelhos e não só onde foi editado. Responde os valores com
+`settingsAt` (carimbo da alteração).
 
 ### POST /settings
 
 A Administração grava os valores novos. Corpo com os valores e
 `settingsAt` (carimbo). Só vale se o carimbo for mais recente que o
 guardado; um POST mais antigo não sobrescreve o mais novo
-(`stale: true`). Padrões: corrida 8, entrega 7, diária 5.
+(`stale: true`). Padrões: corrida 8, entrega 7, diária 5,
+`feeDays` 1.
+
+**Dias de validade da diária (`feeDays`, v1.7.0):** a dona escolhe
+na Administração por quantos dias **um pagamento** do valor da
+diária fica valendo (inteiro positivo; padrão 1, ou seja, 24 h como
+antes). Com `feeDays: 7`, um pagamento de R$ 5 vale 7 dias. O
+**valor** da diária só muda se ela mudar na Administração — aqui
+só muda a duração. Valor inválido (0, negativo, fração ou
+não-numérico) responde **400** `invalid_feeDays` e não altera nada.
+Aceita também `fee_days` e `diasDiaria`.
 
 **Modo gratuito da diária (`freeFee`):** botão/interruptor na
 Administração. Com `freeFee: true`, o mototáxi trabalha **sem
 pagar** a diária (sem Pix, sem trava). Com `freeFee: false` e um
 valor de verdade, o Pix vale como antes (pagamento obrigatório,
-`paidUntil` de 24 h). **Zerar o valor da diária sozinho não deixa
+`paidUntil` de `feeDays` dias). **Zerar o valor da diária sozinho não deixa
 grátis** — sem a flag, a trava continua exigindo `paidUntil` e
 ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 `diariaGratis` e `gratis`.
@@ -308,7 +323,7 @@ ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.6.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.7.0" }`.
 
 ### POST /create-pix
 

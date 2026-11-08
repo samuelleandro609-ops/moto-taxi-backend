@@ -67,6 +67,12 @@
  * recebe 402 fee_required; conta isenta, com paidUntil valido ou
  * com freeFee ligado passa. Conta desconhecida (chave antiga sem
  * conta no servidor) segue como antes.
+ *
+ * v1.7.0: dias de validade da diaria configuraveis (feeDays em
+ * /settings, padrao 1): UM pagamento do valor da diaria vale por N
+ * dias — a dona escolhe N na Administracao e o valor da diaria so
+ * muda se ela mudar. POST /auth/fee passa a calcular o paidUntil no
+ * servidor (agora + feeDays * 24h); feeExempt e freeFee nao mudam.
  */
 
 const express = require("express");
@@ -166,7 +172,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.6.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.7.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -298,14 +304,21 @@ app.get("/payment/:id", async (req, res) => {
 // para um aparelho atrasado nao ressuscitar um valor antigo.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5, freeFee: false };
+const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5, freeFee: false, feeDays: 1 };
 let appSettings = { ...DEFAULT_SETTINGS, settingsAt: 0 };
+
+// Dias de validade da diaria (v1.7.0): UM pagamento do valor da diaria
+// vale por feeDays dias — a dona escolhe N na Administracao (padrao 1,
+// ou seja, 24h como antes). O VALOR da diaria so muda se ela mudar;
+// aqui so muda por quantos dias o valor pago fica valendo. POST
+// /auth/fee calcula paidUntil = agora + feeDays * 24h no servidor.
 
 // Modo gratuito da diaria: quando freeFee e true, o mototaxi trabalha
 // sem pagar a diaria (sem Pix, sem trava). Com freeFee false, o Pix
-// vale como antes (pagamento obrigatorio, paidUntil 24h). Zerar o valor
-// da diaria SOZINHO nao deixa gratis — sem a flag, a trava continua
-// exigindo paidUntil e ninguem consegue ficar online.
+// vale como antes (pagamento obrigatorio, paidUntil = agora +
+// feeDays * 24h). Zerar o valor da diaria SOZINHO nao deixa gratis —
+// sem a flag, a trava continua exigindo paidUntil e ninguem consegue
+// ficar online.
 function pickBoolean(body, keys) {
   for (const k of keys) {
     const v = body[k];
@@ -332,6 +345,27 @@ function pickNumber(body, keys) {
   return undefined;
 }
 
+// Dias de validade da diaria: so vale inteiro positivo (1, 2, 7...).
+// Devolve undefined quando o campo nao veio (null tambem conta como
+// ausente, como em pickNumber); devolve null quando veio um valor
+// invalido (0, negativo, fracao, texto nao-numerico, booleano) —
+// o chamador responde 400 e nao altera nada.
+function pickFeeDays(body, keys) {
+  for (const k of keys) {
+    const v = body[k];
+    if (v === undefined || v === null) continue;
+    if (typeof v === "number") {
+      return Number.isInteger(v) && v > 0 ? v : null;
+    }
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isInteger(n) && n > 0 ? n : null;
+    }
+    return null;
+  }
+  return undefined;
+}
+
 function settingsPublic() {
   const s = appSettings;
   // Devolve todas as variacoes de nome que o site pode usar, no topo e
@@ -342,6 +376,9 @@ function settingsPublic() {
     ride: s.ride,
     delivery: s.delivery,
     fee: s.fee,
+    feeDays: s.feeDays,
+    fee_days: s.feeDays,
+    diasDiaria: s.feeDays,
     freeFee: !!s.freeFee,
     free_fee: !!s.freeFee,
     diariaGratis: !!s.freeFee,
@@ -356,6 +393,9 @@ function settingsPublic() {
       ride: s.ride,
       delivery: s.delivery,
       fee: s.fee,
+      feeDays: s.feeDays,
+      fee_days: s.feeDays,
+      diasDiaria: s.feeDays,
       freeFee: !!s.freeFee,
       free_fee: !!s.freeFee,
       diariaGratis: !!s.freeFee,
@@ -383,13 +423,22 @@ app.post("/settings", (req, res) => {
   const ride = pickNumber(body, ["ride", "ridePrice", "priceRide", "corrida", "ride_value"]);
   const delivery = pickNumber(body, ["delivery", "deliveryPrice", "priceDelivery", "entrega", "delivery_value"]);
   const fee = pickNumber(body, ["fee", "dailyFee", "diaria", "daily_fee", "daily", "fee_value"]);
+  const feeDays = pickFeeDays(body, ["feeDays", "fee_days", "diasDiaria"]);
   const freeFee = pickBoolean(body, ["freeFee", "free_fee", "free", "diariaGratis", "gratis"]);
   const at = pickNumber(body, ["settingsAt", "updatedAt", "timestamp", "version"]);
 
-  if (ride === undefined && delivery === undefined && fee === undefined && freeFee === undefined) {
+  if (feeDays === null) {
+    // Dias de validade invalido (0, negativo, fracao ou nao-numerico):
+    // 400 e nao altera nada — nem os outros valores do mesmo POST.
+    return res.status(400).json({
+      error: "invalid_feeDays",
+      message: "feeDays must be a positive integer."
+    });
+  }
+  if (ride === undefined && delivery === undefined && fee === undefined && feeDays === undefined && freeFee === undefined) {
     return res.status(400).json({
       error: "invalid_settings",
-      message: "at least one of ride, delivery, fee or freeFee must be provided."
+      message: "at least one of ride, delivery, fee, feeDays or freeFee must be provided."
     });
   }
   const incomingAt = typeof at === "number" ? at : Date.now();
@@ -400,6 +449,7 @@ app.post("/settings", (req, res) => {
   if (ride !== undefined) appSettings.ride = ride;
   if (delivery !== undefined) appSettings.delivery = delivery;
   if (fee !== undefined) appSettings.fee = fee;
+  if (feeDays !== undefined) appSettings.feeDays = feeDays;
   if (freeFee !== undefined) appSettings.freeFee = freeFee;
   appSettings.settingsAt = incomingAt;
   return res.json({ ok: true, ...settingsPublic() });
@@ -1334,14 +1384,16 @@ app.post("/auth/change-password", requireAuth, (req, res) => {
 });
 
 // POST /auth/fee — registra a diaria paga na conta (para valer em
-// qualquer aparelho). Corpo: { paidUntil } (ms). So aumenta, nunca
-// diminui. O app chama depois de confirmar o Pix pago.
+// qualquer aparelho). O paidUntil e calculado NO SERVIDOR: agora +
+// feeDays * 24h (v1.7.0 — antes o app mandava paidUntil de 24h fixo
+// e o servidor so guardava; agora a duracao segue o que a dona
+// escolheu na Administracao). UM pagamento do valor da diaria vale
+// por feeDays dias. So aumenta, nunca diminui: se a conta ja tem um
+// paidUntil maior, ele fica. O app chama depois de confirmar o Pix
+// pago; o corpo nao precisa de nada (um paidUntil mandado pelo app
+// e ignorado). feeExempt (dona) e freeFee nao passam por aqui.
 app.post("/auth/fee", requireAuth, (req, res) => {
-  const body = req.body || {};
-  const paidUntil = Number(body.paidUntil);
-  if (!Number.isFinite(paidUntil) || paidUntil <= Date.now()) {
-    return res.status(400).json({ error: "invalid_paidUntil", message: "paidUntil must be a future timestamp." });
-  }
+  const paidUntil = Date.now() + appSettings.feeDays * 24 * 3600 * 1000;
   if (paidUntil > (req.account.paidUntil || 0)) {
     req.account.paidUntil = paidUntil;
     saveAuthStore();
