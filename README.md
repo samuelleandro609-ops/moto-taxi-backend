@@ -86,8 +86,13 @@ clicar no moto no mapa). Corpo:
 
 Chamados pendentes (padrão). `?status=all` lista todos;
 `?mine=<key>` lista os aceitos por aquele mototáxi (para ele
-acompanhar o chamado ativo dele em qualquer aparelho). Resposta:
-`{ "ok": true, "count": 1, "calls": [ ... ] }`.
+acompanhar o chamado ativo dele em qualquer aparelho);
+`?callerPhone=<telefone>` lista os chamados **ativos** (pendente ou
+aceito) de quem chamou — é o que o app usa ao reabrir para restaurar
+o chamado/rota que estava em andamento; `?excludeCaller=<telefone>`
+tira da lista os chamados feitos por aquele telefone — é o que os
+motos usam para o chamado **não** aparecer para quem chamou.
+Resposta: `{ "ok": true, "count": 1, "calls": [ ... ] }`.
 
 ### GET /calls/:id
 
@@ -111,33 +116,67 @@ Atualiza a fase do chamado. Corpo: `{ "phase": "coleta_confirmada" }`
 Conclui o chamado. Corpo: `{ "key": "..." }`. Só o mototáxi que
 aceitou pode concluir (403 para outro).
 
-### Voz ao vivo — sinalização WebRTC (push-to-talk)
+### POST /calls/:id/cancel
 
-Durante a rota ativa, o mototáxi segura um botão para falar e o
-cliente ouve ao vivo (walkie-talkie, só moto → cliente). O servidor
-só faz a **sinalização**: guarda e entrega as mensagens do "combinado"
-da ligação (oferta SDP, resposta SDP e candidatos ICE). O áudio vai
-direto de navegador para navegador (peer-to-peer via WebRTC) e **não**
-passa pelo servidor. O botão só existe durante a rota ativa; quando
-ela acaba, as duas pontas fecham a conexão.
+Cancela o chamado. Corpo: `{ "key": "..." }` (id da conta). Pode
+cancelar: o **cliente** que chamou (o telefone da conta bate com o
+do chamado) ou o **mototáxi** que aceitou. Vale em chamado pendente
+ou aceito — o cliente cancela desde "procurando mototáxi" e durante
+toda a espera e a rota. Cancelado fica visível por 10 min (como
+concluído) e depois some. Cancelar de novo um chamado já cancelado
+ou concluído devolve o estado atual, sem erro.
 
-`POST /calls/:id/signal` — uma ponta envia um sinal para a outra.
-Corpo: `{ "from": "driver"|"caller", "key": "<chave da conta>",
-"type": "offer"|"answer"|"ice"|"bye", "data": {...} }`. Só vale em
-chamado aceito (409 fora da rota ativa); só as duas pontas do chamado
-podem trocar sinais (403 para outra chave). `offer` é a oferta SDP do
-mototáxi, `answer` a resposta SDP do cliente, `ice` um candidato ICE
-de qualquer ponta e `bye` avisa que a ponta fechou a conexão.
+### POST /calls/:id/touch
 
-`GET /calls/:id/signal?for=driver|caller&key=<chave>&since=<seq>` —
-uma ponta busca os sinais novos para ela. Devolve só as mensagens da
-outra ponta com `seq` maior que `since`, em ordem, mais `lastSeq`.
-Cada ponta guarda o último `seq` recebido e pergunta de tempos em
-tempos (polling, como o resto do app).
+Uma ponta avisa que ainda está com o app aberto no chamado — o app
+chama a cada poll do chamado ativo, dos dois lados. Corpo:
+`{ "key": "..." }`. Atualiza o `updatedAt` para o chamado não
+expirar enquanto alguém está olhando. Só as duas pontas do chamado
+podem dar touch (403 para outra chave).
+
+### Chat da corrida ("Converse com o mototáxi")
+
+Durante o chamado (aguardando ou em rota), cliente e mototáxi
+trocam mensagens de texto; o app de quem recebe **lê em voz alta**
+(`speechSynthesis`, volume máximo) para os dois ficarem atentos.
+O texto passa pelo servidor para chegar no outro aparelho. A
+mensagem também serve para o cliente mandar o ponto de referência
+ou o nome da rua quando o GPS não marcou preciso.
+
+`POST /calls/:id/messages` — envia. Corpo: `{ "from":
+"driver"|"caller", "key": "<chave da conta>", "text": "...",
+"photo": "data:image/jpeg;base64,..." }` (texto máx. 500 caracteres;
+`photo` é opcional — o **cliente** manda foto do local, da casa ou
+da referência, tirada na hora pela câmera ou escolhida da galeria, e
+o mototáxi vê a foto no chat dele; a foto é reduzida no aparelho
+antes de enviar, máx. 200000 caracteres). Basta texto **ou** foto.
+Só vale em chamado pendente ou aceito (409 fora disso); só as duas
+pontas do chamado podem trocar mensagens (403 para outra chave).
+
+`GET /calls/:id/messages?for=driver|caller&key=<chave>&since=<seq>`
+— busca as mensagens novas. Devolve **todas** as mensagens com `seq`
+maior que `since` (das duas pontas, em ordem), mais `lastSeq`, para
+o app remontar a conversa ao reabrir. Mandar mensagem também mantém
+o chamado vivo (como o touch).
+
+**Regra da voz:** o app lê em voz alta (voz do Google, volume
+máximo) **só o que o OUTRO digitou** — o cliente digita e o mototáxi
+ouve; o mototáxi digita e o cliente ouve. A voz **nunca** lê em voz
+alta a própria mensagem de quem digitou (sem eco).
+
+**VoIP ao vivo removido:** o botão de falar ao vivo (walkie-talkie,
+WebRTC) foi removido porque não funcionou. Não há mais botão de voz
+nem endpoints de sinalização (`/calls/:id/signal` não existe mais).
+A comunicação durante a corrida é **só** pelo chat de texto acima.
 
 Expiração: presença sem heartbeat há mais de ~15 s some da lista;
-chamado pendente expira em 30 min, aceito em 60 min, concluído fica
-visível por 10 min.
+chamado pendente expira em 60 min, aceito em 180 min (3 h),
+concluído/cancelado fica visível por 10 min. O chamado **não**
+some quando o app fecha: o app mantém o chamado vivo com
+`POST /calls/:id/touch` enquanto está aberto e, ao reabrir, busca
+o chamado ativo (`GET /calls?callerPhone` para quem chamou,
+`GET /calls?mine` para o mototáxi) e restaura a rota. Só cancelar
+ou concluir termina o chamado.
 
 ## Contas no servidor (/auth)
 
@@ -236,11 +275,20 @@ A Administração grava os valores novos. Corpo com os valores e
 guardado; um POST mais antigo não sobrescreve o mais novo
 (`stale: true`). Padrões: corrida 8, entrega 7, diária 5.
 
+**Modo gratuito da diária (`freeFee`):** botão/interruptor na
+Administração. Com `freeFee: true`, o mototáxi trabalha **sem
+pagar** a diária (sem Pix, sem trava). Com `freeFee: false` e um
+valor de verdade, o Pix vale como antes (pagamento obrigatório,
+`paidUntil` de 24 h). **Zerar o valor da diária sozinho não deixa
+grátis** — sem a flag, a trava continua exigindo `paidUntil` e
+ninguém consegue ficar online. Aceita também `free_fee`, `free`,
+`diariaGratis` e `gratis`.
+
 ## Endpoints Pix
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.4.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.5.0" }`.
 
 ### POST /create-pix
 
