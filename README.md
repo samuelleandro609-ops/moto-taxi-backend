@@ -45,6 +45,9 @@ está online. Corpo:
 Resposta: `{ "ok": true, "online": true, "key": "..." }`. Com
 `"online": false` o moto sai da lista na hora. A foto é opcional nos
 heartbeats seguintes — sem ela, o servidor mantém a última foto.
+Sem diária válida (e sem isenção nem modo gratuito), o servidor
+responde **402** `fee_required` — a conta da dona (isenta) e quem
+pagou passam.
 
 ### GET /presence
 
@@ -103,7 +106,9 @@ Detalhe de um chamado. 404 se não existir.
 Um mototáxi aceita o chamado. Corpo: `{ "key": "...", "name": "João" }`.
 Só o primeiro aceita — os outros recebem **409** e o chamado some da
 lista de pendentes deles. Se o chamado foi dirigido a um moto
-(`targetKey`), só ele pode aceitar (**403** para os demais).
+(`targetKey`), só ele pode aceitar (**403** para os demais). Sem
+diária válida, **402** `fee_required` (a conta da dona, isenta,
+aceita sem pagar).
 
 ### POST /calls/:id/phase
 
@@ -203,6 +208,17 @@ conta. Apagar não permite apagar a própria conta nem outra admin — e
 revoga os tokens da conta apagada, então ela perde o acesso em todos
 os aparelhos.
 
+**Isenção da diária (dona/admin, v1.6.0):** a conta da dona (a
+primeira registrada, administradora) **não paga diária** — fica
+liberada para trabalhar sem pagar nada (`feeExempt: true` na conta,
+persistido em `accounts.json`, devolvido em `GET /auth/me` e em
+toda resposta com a conta, junto com `feeValid`). Todos os outros
+mototáxis continuam pagando a diária de R$ 5 (ou o modo gratuito
+quando ligado). O servidor confere a diária em `POST /presence`
+(ficar online / heartbeat) e em `POST /calls/:id/accept`: conta
+conhecida sem diária válida recebe **402** `fee_required`; conta
+isenta, com `paidUntil` válido ou com `freeFee` ligado passa.
+
 **Sessão:** token aleatório (Bearer) válido por 30 dias.
 
 ### POST /auth/register
@@ -211,9 +227,11 @@ Cria a conta. Corpo: `{ "name", "phone", "password", "role":
 "passageiro" | "mototaxi" | "comercio", "photo"?, "plate"?, "bike"?,
 "shopAddr"? }`. Resposta (201): `{ "ok": true, "token", "account": {
 "id", "name", "phone", "role", "photo", "plate", "bike", "shopAddr",
-"paidUntil", "isAdmin", "createdAt" } }`. Telefone já registrado com
-a mesma senha devolve a conta existente (migração idempotente);
-com senha diferente, **409** `phone_exists`.
+"paidUntil", "isAdmin", "feeExempt", "feeValid", "createdAt" } }`.
+Telefone já registrado com a mesma senha devolve a conta existente
+(migração idempotente); com senha diferente, **409** `phone_exists`.
+A primeira conta registrada vira admin **e isenta da diária**
+(`feeExempt: true`); as demais nascem com `feeExempt: false`.
 
 ### POST /auth/login
 
@@ -226,7 +244,9 @@ errada: **401** `invalid_password`. 10 falhas em 10 min por telefone:
 ### GET /auth/me
 
 Quem está logado. Header: `Authorization: Bearer <token>`. Sem
-token válido: **401** `unauthorized`.
+token válido: **401** `unauthorized`. A resposta traz `feeExempt`
+(só `true` para a dona) e `feeValid` (liberado: isento, `paidUntil`
+válido ou modo gratuito ligado).
 
 ### POST /auth/logout
 
@@ -288,7 +308,7 @@ ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.5.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.6.0" }`.
 
 ### POST /create-pix
 
