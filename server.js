@@ -100,6 +100,12 @@
  * esperando e o mototaxi fica livre para aceitar outro chamado. O
  * cancelamento pelo CLIENTE nao muda: cancela o chamado de vez
  * (status "cancelled").
+ *
+ * v1.8.2: audio do chat aceita parametros MIME (;codecs=opus) — o
+ * MediaRecorder do Chrome/Android produz
+ * data:audio/webm;codecs=opus;base64,... e o regex anterior
+ * rejeitava com 400 invalid_audio: o audio "enviado" nunca era
+ * salvo. Nenhuma outra mudanca de comportamento.
  */
 
 const express = require("express");
@@ -199,7 +205,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.1" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.2" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -1112,17 +1118,22 @@ app.post("/calls/:id/messages", (req, res) => {
       });
     }
   }
-  // Audio gravado (v1.8.0, chat so audio): o app grava com o
-  // microfone (MediaRecorder, ate 60 s) e manda como data URL
-  // audio/* em base64; max 200000 caracteres (~150 KB) para caber
-  // no limite de 256 KB do corpo JSON. Quem recebe aperta para ouvir.
+  // Audio gravado (v1.8.0, chat so audio; v1.8.2 aceita parametros
+  // MIME como ;codecs=opus): o app grava com o microfone
+  // (MediaRecorder, ate 60 s) e manda como data URL audio/* em
+  // base64; max 200000 caracteres (~150 KB) para caber no limite de
+  // 256 KB do corpo JSON. Quem recebe aperta para ouvir. O regex
+  // aceita parametros do tipo (;codecs=opus) porque o MediaRecorder
+  // do Chrome/Android produz data:audio/webm;codecs=opus;base64,...
+  // e a versao anterior rejeitava esse formato com 400 invalid_audio
+  // (o audio "enviado" nunca chegava a ser salvo).
   let audio = "";
   let durationSec = 0;
   if (typeof body.audio === "string" && body.audio.trim() !== "") {
     audio = body.audio.trim();
     if (
       audio.length > 200000 ||
-      !/^data:audio\/[a-z0-9.+-]+;base64,/.test(audio)
+      !/^data:audio\/[a-z0-9.+-]+(?:;[^;,=]+=[^;,]+)*;base64,/.test(audio)
     ) {
       return res.status(400).json({
         error: "invalid_audio",

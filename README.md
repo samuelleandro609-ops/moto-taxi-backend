@@ -342,10 +342,15 @@ ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.8.1" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.8.2" }`.
 
 ## Changelog
 
+- **v1.8.2** — áudio do chat aceita parâmetros MIME (`;codecs=opus`):
+  o MediaRecorder do Chrome/Android produz
+  `data:audio/webm;codecs=opus;base64,...` e o regex anterior
+  rejeitava com 400 `invalid_audio` — o áudio "enviado" nunca era
+  salvo. Nenhuma outra mudança de comportamento.
 - **v1.8.1** — cancelamento pelo mototáxi devolve o chamado para
   espera: `POST /calls/:id/cancel` pelo mototáxi que aceitou volta o
   chamado para `"pending"` / `"aguardando"` (com
