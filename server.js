@@ -56,6 +56,17 @@
  * (/calls/:id/messages — texto entre cliente e moto, para o app ler
  * em voz alta no outro aparelho). GET /calls?excludeCaller tira o
  * chamado da lista de quem chamou (o chamado so vai para os motos).
+ *
+ * v1.6.0: a conta da DONA (a primeira registrada, administradora)
+ * e ISENTA da diaria — nao paga nada e fica liberada para trabalhar
+ * (feeExempt: true na conta, persistido em accounts.json; o app le
+ * em GET /auth/me). Os demais mototaxis continuam pagando a diaria
+ * de R$ 5 (ou o modo gratuito quando ligado). O servidor passa a
+ * conferir a diaria em POST /presence (ficar online / heartbeat) e
+ * em POST /calls/:id/accept: conta conhecida sem diaria valida
+ * recebe 402 fee_required; conta isenta, com paidUntil valido ou
+ * com freeFee ligado passa. Conta desconhecida (chave antiga sem
+ * conta no servidor) segue como antes.
  */
 
 const express = require("express");
@@ -155,7 +166,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.5.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.6.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -506,6 +517,17 @@ app.post("/presence", (req, res) => {
       .status(400)
       .json({ error: "invalid_location", message: "lat/lng are required." });
   }
+  // Diaria: so fica online (e mantem o heartbeat) quem tem a diaria
+  // valida — paga, isento (a dona) ou modo gratuito ligado. Conta
+  // conhecida sem diaria valida recebe 402. Conta desconhecida
+  // (chave antiga, sem conta no servidor) segue como antes.
+  const account = findAccountById(key);
+  if (account && !isFeeValid(account)) {
+    return res.status(402).json({
+      error: "fee_required",
+      message: "daily fee is required to go online."
+    });
+  }
   const prev = presence.get(key);
   const photo = cleanStr(body.photo, 200000);
   presence.set(key, {
@@ -671,6 +693,16 @@ app.post("/calls/:id/accept", (req, res) => {
     return res.status(403).json({
       error: "not_targeted_driver",
       message: "this call is directed to another driver."
+    });
+  }
+  // Diaria: so aceita chamado quem tem a diaria valida — paga,
+  // isento (a dona) ou modo gratuito ligado. Conta conhecida sem
+  // diaria valida recebe 402. Conta desconhecida segue como antes.
+  const account = findAccountById(key);
+  if (account && !isFeeValid(account)) {
+    return res.status(402).json({
+      error: "fee_required",
+      message: "daily fee is required to accept calls."
     });
   }
   c.status = "accepted";
@@ -985,6 +1017,12 @@ app.get("/calls/:id/messages", (req, res) => {
 // diaria paga valer na conta em qualquer aparelho — antes ela so valia
 // no aparelho onde foi paga. O app grava via POST /auth/fee depois de
 // confirmar o Pix pago (mesma validacao de antes, no aparelho).
+// Isencao (v1.6.0): a conta da DONA (primeira registrada,
+// administradora) NAO paga diaria — feeExempt: true na conta,
+// persistido em accounts.json, devolvido em GET /auth/me (e em
+// toda resposta com a conta). O app trata feeExempt como liberado.
+// O servidor confere a diaria em POST /presence e em
+// POST /calls/:id/accept (402 fee_required sem diaria valida).
 // ---------------------------------------------------------------------------
 
 const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
@@ -1000,6 +1038,7 @@ function loadAuthStore() {
     if (data && Array.isArray(data.accounts) && Array.isArray(data.tokens)) {
       authStore = data;
       pruneTokens();
+      normalizeFeeExempt();
     } else {
       console.log("accounts.json invalido (formato inesperado); comecando vazio.");
     }
@@ -1016,6 +1055,24 @@ function saveAuthStore() {
   } catch (err) {
     console.log("nao foi possivel gravar accounts.json: " + err.message);
   }
+}
+
+// Isencao da diaria: SO a conta administradora (a primeira
+// registrada, a dona) e isenta — nenhuma outra. Ao carregar o
+// arquivo, normaliza: admin sem feeExempt ganha a isencao (cobre
+// contas criadas antes da v1.6.0, que nao tinham o campo) e
+// nao-admin com feeExempt perde (a isencao so nasce no registro da
+// primeira conta). Grava de volta se algo mudou.
+function normalizeFeeExempt() {
+  let changed = false;
+  for (const a of authStore.accounts) {
+    const exempt = !!a.isAdmin;
+    if (!!a.feeExempt !== exempt) {
+      a.feeExempt = exempt;
+      changed = true;
+    }
+  }
+  if (changed) saveAuthStore();
 }
 
 function normalizePhone(v) {
@@ -1043,6 +1100,18 @@ function checkPassword(password, stored) {
   return crypto.timingSafeEqual(actual, expected);
 }
 
+// Diaria valida? A conta esta liberada quando: e ISENTA (a dona,
+// administradora — feeExempt: true), OU o modo gratuito esta ligado
+// (freeFee em /settings), OU a diaria paga ainda nao venceu
+// (paidUntil no futuro). E o que o app usa (via GET /auth/me) e o
+// que o servidor confere em /presence e em /calls/:id/accept.
+function isFeeValid(account) {
+  if (!account) return false;
+  if (account.feeExempt) return true;
+  if (appSettings.freeFee) return true;
+  return (account.paidUntil || 0) > Date.now();
+}
+
 function accountPublic(a) {
   return {
     id: a.id,
@@ -1055,6 +1124,8 @@ function accountPublic(a) {
     shopAddr: a.shopAddr || "",
     paidUntil: a.paidUntil || 0,
     isAdmin: !!a.isAdmin,
+    feeExempt: !!a.feeExempt,
+    feeValid: isFeeValid(a),
     createdAt: a.createdAt
   };
 }
@@ -1191,6 +1262,9 @@ app.post("/auth/register", (req, res) => {
     shopAddr: cleanStr(body.shopAddr, 300),
     paidUntil: 0,
     isAdmin,
+    // A primeira conta (a dona, administradora) e ISENTA da diaria:
+    // trabalha sem pagar nada. Nenhuma outra conta nasce isenta.
+    feeExempt: isAdmin,
     createdAt: Date.now()
   };
   authStore.accounts.push(account);
