@@ -40,11 +40,22 @@
  * aqui: ele expira e e apagado depois de ~30 dias, entao as contas
  * sumiriam sozinhas.
  *
- * Voz ao vivo (/calls/:id/signal): durante a rota ativa, o mototaxi
- * segura um botao para falar e o cliente ouve ao vivo (walkie-talkie,
- * so moto -> cliente). O servidor so faz a SINALIZACAO WebRTC (oferta
- * SDP, resposta SDP e candidatos ICE); o audio vai direto de navegador
- * para navegador, sem passar por aqui.
+ * Comunicacao na corrida: SO o chat de texto "Converse com o
+ * mototaxi" (/calls/:id/messages). O app le em voz alta (voz do
+ * Google) o que o OUTRO digitou — nunca a propria mensagem. O VoIP
+ * ao vivo (walkie-talkie, WebRTC) foi REMOVIDO (nao funcionou):
+ * sem botao de falar, sem codigo WebRTC e sem os endpoints de
+ * sinalizacao /calls/:id/signal.
+ *
+ * v1.5.0: chamado/rota PERSISTE (GET /calls?callerPhone busca o
+ * chamado ativo de quem chamou; POST /calls/:id/touch mantem o
+ * chamado vivo enquanto o app esta aberto; POST /calls/:id/cancel
+ * cancela — cliente ou moto; TTLs maiores); modo gratuito da diaria
+ * (freeFee em /settings — com ele ligado o moto trabalha sem pagar,
+ * sem Pix; com ele desligado o Pix vale como antes); chat da corrida
+ * (/calls/:id/messages — texto entre cliente e moto, para o app ler
+ * em voz alta no outro aparelho). GET /calls?excludeCaller tira o
+ * chamado da lista de quem chamou (o chamado so vai para os motos).
  */
 
 const express = require("express");
@@ -144,7 +155,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.4.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.5.0" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -276,8 +287,27 @@ app.get("/payment/:id", async (req, res) => {
 // para um aparelho atrasado nao ressuscitar um valor antigo.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5 };
+const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5, freeFee: false };
 let appSettings = { ...DEFAULT_SETTINGS, settingsAt: 0 };
+
+// Modo gratuito da diaria: quando freeFee e true, o mototaxi trabalha
+// sem pagar a diaria (sem Pix, sem trava). Com freeFee false, o Pix
+// vale como antes (pagamento obrigatorio, paidUntil 24h). Zerar o valor
+// da diaria SOZINHO nao deixa gratis — sem a flag, a trava continua
+// exigindo paidUntil e ninguem consegue ficar online.
+function pickBoolean(body, keys) {
+  for (const k of keys) {
+    const v = body[k];
+    if (typeof v === "boolean") return v;
+    if (typeof v === "number") return v !== 0;
+    if (typeof v === "string") {
+      const s = v.trim().toLowerCase();
+      if (s === "true" || s === "1" || s === "sim") return true;
+      if (s === "false" || s === "0" || s === "nao" || s === "não") return false;
+    }
+  }
+  return undefined;
+}
 
 function pickNumber(body, keys) {
   for (const k of keys) {
@@ -301,6 +331,9 @@ function settingsPublic() {
     ride: s.ride,
     delivery: s.delivery,
     fee: s.fee,
+    freeFee: !!s.freeFee,
+    free_fee: !!s.freeFee,
+    diariaGratis: !!s.freeFee,
     ridePrice: s.ride,
     deliveryPrice: s.delivery,
     dailyFee: s.fee,
@@ -312,6 +345,9 @@ function settingsPublic() {
       ride: s.ride,
       delivery: s.delivery,
       fee: s.fee,
+      freeFee: !!s.freeFee,
+      free_fee: !!s.freeFee,
+      diariaGratis: !!s.freeFee,
       ridePrice: s.ride,
       deliveryPrice: s.delivery,
       dailyFee: s.fee,
@@ -336,12 +372,13 @@ app.post("/settings", (req, res) => {
   const ride = pickNumber(body, ["ride", "ridePrice", "priceRide", "corrida", "ride_value"]);
   const delivery = pickNumber(body, ["delivery", "deliveryPrice", "priceDelivery", "entrega", "delivery_value"]);
   const fee = pickNumber(body, ["fee", "dailyFee", "diaria", "daily_fee", "daily", "fee_value"]);
+  const freeFee = pickBoolean(body, ["freeFee", "free_fee", "free", "diariaGratis", "gratis"]);
   const at = pickNumber(body, ["settingsAt", "updatedAt", "timestamp", "version"]);
 
-  if (ride === undefined && delivery === undefined && fee === undefined) {
+  if (ride === undefined && delivery === undefined && fee === undefined && freeFee === undefined) {
     return res.status(400).json({
       error: "invalid_settings",
-      message: "at least one of ride, delivery or fee must be a number >= 0."
+      message: "at least one of ride, delivery, fee or freeFee must be provided."
     });
   }
   const incomingAt = typeof at === "number" ? at : Date.now();
@@ -352,6 +389,7 @@ app.post("/settings", (req, res) => {
   if (ride !== undefined) appSettings.ride = ride;
   if (delivery !== undefined) appSettings.delivery = delivery;
   if (fee !== undefined) appSettings.fee = fee;
+  if (freeFee !== undefined) appSettings.freeFee = freeFee;
   appSettings.settingsAt = incomingAt;
   return res.json({ ok: true, ...settingsPublic() });
 });
@@ -370,9 +408,14 @@ app.post("/settings", (req, res) => {
 // ---------------------------------------------------------------------------
 
 const PRESENCE_TTL_MS = 15000; // heartbeat recente: ultimos 15 s
-const CALL_PENDING_TTL_MS = 30 * 60 * 1000; // chamado pendente expira em 30 min
-const CALL_ACTIVE_TTL_MS = 60 * 60 * 1000; // aceito expira em 60 min
-const CALL_DONE_TTL_MS = 10 * 60 * 1000; // concluido fica visivel por 10 min
+// O chamado/rota PERSISTE: so termina quando alguem cancela ou conclui
+// (ou conclui a entrega/corrida). Por isso os prazos sao longos —
+// fechar a janela ou o app nao pode apagar o chamado. O app mantem o
+// chamado vivo com POST /calls/:id/touch enquanto esta aberto, e ao
+// reabrir busca o chamado ativo (GET /calls?callerPhone / ?mine).
+const CALL_PENDING_TTL_MS = 60 * 60 * 1000; // chamado pendente expira em 60 min
+const CALL_ACTIVE_TTL_MS = 180 * 60 * 1000; // aceito expira em 180 min (3 h)
+const CALL_DONE_TTL_MS = 10 * 60 * 1000; // concluido/cancelado fica visivel por 10 min
 
 // key (chave da conta) -> { key, name, photo, bike, plate, lat, lng, online, updatedAt }
 const presence = new Map();
@@ -427,7 +470,7 @@ function pruneStores() {
           : CALL_DONE_TTL_MS;
     if (now - c.updatedAt > ttl) {
       calls.delete(id);
-      signals.delete(id);
+      chatMessages.delete(id);
     }
   }
 }
@@ -557,18 +600,31 @@ app.post("/calls", (req, res) => {
 
 // GET /calls — chamados pendentes (padrao). ?status=all lista todos;
 // ?mine=<key> lista os aceitos por aquele mototaxi (para ele acompanhar
-// o chamado ativo dele em qualquer aparelho).
+// o chamado ativo dele em qualquer aparelho); ?callerPhone=<telefone>
+// lista os chamados ATIVOS (pendente ou aceito) de quem chamou — e o
+// que o app usa ao reabrir para RESTAURAR o chamado/rota que estava
+// em andamento; ?excludeCaller=<telefone> tira da lista os chamados
+// feitos por aquele telefone — e o que os motos usam para o chamado
+// NAO aparecer para quem chamou (só vai para quem esta trabalhando).
 app.get("/calls", (req, res) => {
   pruneStores();
   const status = cleanStr(req.query.status, 20) || "pending";
   const mine = cleanStr(req.query.mine, 128);
+  const callerPhone = normalizePhone(req.query.callerPhone || "");
+  const excludeCaller = normalizePhone(req.query.excludeCaller || "");
   const list = [];
   for (const c of calls.values()) {
-    if (mine) {
+    if (callerPhone) {
+      // Chamado ativo de quem chamou: so pendente ou aceito.
+      if (normalizePhone(c.callerPhone) !== callerPhone) continue;
+      if (c.status !== "pending" && c.status !== "accepted") continue;
+    } else if (mine) {
       if (c.acceptedBy !== mine) continue;
     } else if (status !== "all" && c.status !== status) {
       continue;
     }
+    // O chamado nunca aparece para quem chamou.
+    if (excludeCaller && normalizePhone(c.callerPhone) === excludeCaller) continue;
     list.push(callPublic(c));
   }
   list.sort((a, b) => a.createdAt - b.createdAt);
@@ -681,48 +737,80 @@ app.post("/calls/:id/complete", (req, res) => {
   return res.json({ ok: true, call: callPublic(c) });
 });
 
+// POST /calls/:id/cancel — cancela o chamado. Corpo: { key } (id da
+// conta). Pode cancelar: o CLIENTE que chamou (o telefone da conta
+// bate com callerPhone) ou o MOTOTAXI que aceitou (key == acceptedBy).
+// Vale em chamado pendente ou aceito — o cliente cancela desde
+// "procurando mototaxi" e durante toda a espera e a rota. Cancelado
+// fica visivel por 10 min (como concluido) e depois some. Cancelar
+// de novo um chamado ja cancelado/concluido devolve o estado atual
+// (sem erro), para um toque duplo nao quebrar nada.
+app.post("/calls/:id/cancel", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status === "completed" || c.status === "cancelled") {
+    return res.json({ ok: true, already: true, call: callPublic(c) });
+  }
+  const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  const isDriver = !!c.acceptedBy && key === c.acceptedBy;
+  const isCaller = callParty(c, "caller", key);
+  if (!isDriver && !isCaller) {
+    return res.status(403).json({
+      error: "not_call_party",
+      message: "only the caller or the driver who accepted can cancel this call."
+    });
+  }
+  c.status = "cancelled";
+  c.phase = "cancelado";
+  c.completedAt = Date.now();
+  c.updatedAt = Date.now();
+  return res.json({ ok: true, call: callPublic(c) });
+});
+
+// POST /calls/:id/touch — uma ponta avisa que ainda esta com o app
+// aberto no chamado (o app chama a cada poll do chamado ativo, dos
+// dois lados). Atualiza o updatedAt para o chamado nao expirar
+// enquanto alguem esta olhando — fechar a janela e reabrir nao apaga
+// o chamado. So as duas pontas do chamado podem dar touch (403 para
+// outra chave).
+app.post("/calls/:id/touch", (req, res) => {
+  const c = calls.get(String(req.params.id || ""));
+  if (!c) {
+    return res
+      .status(404)
+      .json({ error: "call_not_found", message: "call not found." });
+  }
+  if (c.status === "completed" || c.status === "cancelled") {
+    return res.json({ ok: true, call: callPublic(c) });
+  }
+  const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  if (!callParty(c, "driver", key) && !callParty(c, "caller", key)) {
+    return res.status(403).json({
+      error: "not_call_party",
+      message: "only a party of this call can touch it."
+    });
+  }
+  c.updatedAt = Date.now();
+  return res.json({ ok: true, call: callPublic(c) });
+});
+
 // ---------------------------------------------------------------------------
-// Voz ao vivo (push-to-talk, walkie-talkie) — sinalizacao WebRTC
+// Parte do chamado — quem e cada ponta
 //
-// Durante uma corrida/entrega ativa, o mototaxi segura um botao para
-// falar e o cliente (passageiro ou comercio) ouve a voz dele ao vivo;
-// ao soltar, para. So um sentido: moto -> cliente. O audio vai DIRETO
-// de navegador para navegador (peer-to-peer via WebRTC); o servidor so
-// faz a SINALIZACAO, isto e, guarda e entrega as mensagens do
-// "combinado" da ligacao (oferta SDP, resposta SDP e candidatos ICE).
-// Nada de audio passa por aqui.
-//
-// Como o app ja faz polling (a cada ~5 s), a sinalizacao usa polling
-// tambem: cada ponta pergunta de tempos em tempos se chegou mensagem
-// nova para ela (GET /calls/:id/signal?for=...&since=...). O botao so
-// existe durante a rota ativa, entao a conexao e por chamado: quando
-// a rota acaba, as duas pontas fecham a conexao e a fila de sinais
-// daquele chamado e descartada junto com o chamado (no pruneStores).
-//
-// Regras:
-// - So vale em chamado "accepted" (rota ativa). Enviar sinal em
-//   chamado pendente/concluido -> 409.
-// - So as duas pontas do chamado podem trocar sinais: o mototaxi
-//   (key == call.acceptedBy) manda como "driver"; o cliente (conta
-//   cujo telefone bate com call.callerPhone) manda como "caller".
-// - Cada mensagem tem um numero de sequencia (seq) por chamado; o GET
-//   devolve so as mensagens para aquela ponta com seq > since.
-// - Fila em MEMORIA, como presenca e chamados; some no reinicio.
+// driver: a chave da conta que aceitou o chamado. caller: a conta cujo
+// telefone (so digitos) bate com o telefone do chamado. Usado pelo
+// cancelamento, pelo touch e pelo chat, para so as duas pontas do
+// chamado agirem nele. (O VoIP ao vivo foi removido: nao funcionou.)
 // ---------------------------------------------------------------------------
-
-const SIGNAL_MAX_PER_CALL = 100;
-
-// id do chamado -> { seq, messages: [{ seq, from, type, data, at }] }
-const signals = new Map();
-
-function signalPublic(m) {
-  return { seq: m.seq, from: m.from, type: m.type, data: m.data, at: m.at };
-}
 
 // Confere se a chave pertence a ponta indicada daquele chamado.
-// driver: a chave da conta que aceitou o chamado. caller: a conta cujo
-// telefone (so digitos) bate com o telefone do chamado.
-function signalParty(call, side, key) {
+function callParty(call, side, key) {
   if (!key) return false;
   if (side === "driver") {
     return !!call.acceptedBy && key === call.acceptedBy;
@@ -735,22 +823,49 @@ function signalParty(call, side, key) {
   return false;
 }
 
-// POST /calls/:id/signal — uma ponta envia um sinal para a outra.
-// Corpo: { from: "driver"|"caller", key, type: "offer"|"answer"|"ice"|"bye",
-// data: {...} }. "offer" e a oferta SDP do mototaxi; "answer" e a
-// resposta SDP do cliente; "ice" e um candidato ICE de qualquer ponta;
-// "bye" avisa que a ponta fechou a conexao (fim da rota).
-app.post("/calls/:id/signal", (req, res) => {
+// ---------------------------------------------------------------------------
+// Chat da corrida ("Converse com o mototaxi") — mensagens de texto
+//
+// Durante o chamado (aguardando ou em rota), cliente e mototaxi
+// trocam mensagens de texto; o app de quem recebe LE em voz alta
+// (speechSynthesis, volume maximo) para os dois ficarem atentos.
+// O texto passa pelo servidor para chegar no outro aparelho (o app e
+// estatico e cada aparelho so ve o proprio localStorage). A mensagem
+// tambem serve para o cliente mandar o ponto de referencia ou o nome
+// da rua quando o GPS nao marcou preciso.
+//
+// POST /calls/:id/messages { from, key, text, photo? } — envia
+// (texto max 500 caracteres; foto opcional, data URL base64 ate
+// 200000 caracteres — o cliente manda foto do local, da casa ou da
+// referencia, e o mototaxi ve no chat dele). GET
+// /calls/:id/messages?for=...&key=...&since=... —
+// devolve TODAS as mensagens com seq > since (das duas pontas, em
+// ordem), para o app remontar a conversa ao reabrir. So as duas
+// pontas do chamado (mesma regra de parte do chamado). Fila em
+// MEMORIA, descartada junto com o chamado.
+// ---------------------------------------------------------------------------
+
+const CHAT_MAX_PER_CALL = 100;
+const CHAT_MAX_LEN = 500;
+
+// id do chamado -> { seq, messages: [{ seq, from, text, at }] }
+const chatMessages = new Map();
+
+function chatPublic(m) {
+  return { seq: m.seq, from: m.from, text: m.text, photo: m.photo || "", at: m.at };
+}
+
+app.post("/calls/:id/messages", (req, res) => {
   const c = calls.get(String(req.params.id || ""));
   if (!c) {
     return res
       .status(404)
       .json({ error: "call_not_found", message: "call not found." });
   }
-  if (c.status !== "accepted") {
+  if (c.status !== "pending" && c.status !== "accepted") {
     return res.status(409).json({
       error: "call_not_active",
-      message: "voice signaling is only available while the call is accepted."
+      message: "messages are only available while the call is pending or accepted."
     });
   }
   const body = req.body || {};
@@ -762,48 +877,48 @@ app.post("/calls/:id/signal", (req, res) => {
     });
   }
   const key = cleanStr(body.key, 128);
-  if (!signalParty(c, from, key)) {
+  if (!callParty(c, from, key)) {
     return res.status(403).json({
       error: "not_call_party",
       message: "this key does not belong to a party of this call."
     });
   }
-  const type = cleanStr(body.type, 10);
-  if (type !== "offer" && type !== "answer" && type !== "ice" && type !== "bye") {
-    return res.status(400).json({
-      error: "invalid_type",
-      message: 'type must be "offer", "answer", "ice" or "bye".'
-    });
+  const text = cleanStr(body.text, CHAT_MAX_LEN);
+  // Foto do local (opcional): o cliente manda foto da casa, do ponto
+  // onde esta ou da referencia, tirada na hora pela camera ou da
+  // galeria; o mototaxi ve no chat dele. Data URL JPEG/PNG/WebP em
+  // base64, reduzida no aparelho; max 200000 caracteres (~150 KB)
+  // para caber no limite de 256 KB do corpo JSON.
+  let photo = "";
+  if (typeof body.photo === "string" && body.photo.trim() !== "") {
+    photo = body.photo.trim();
+    if (photo.length > 200000 || !/^data:image\/(jpeg|jpg|png|webp);base64,/.test(photo)) {
+      return res.status(400).json({
+        error: "invalid_photo",
+        message: "photo must be a data:image/jpeg|png|webp base64 URL up to 200000 characters."
+      });
+    }
   }
-  const data = body.data;
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
-    return res.status(400).json({
-      error: "invalid_data",
-      message: "data must be an object."
-    });
+  if (!text && !photo) {
+    return res
+      .status(400)
+      .json({ error: "missing_text", message: "text or photo is required." });
   }
-  let queue = signals.get(c.id);
+  let queue = chatMessages.get(c.id);
   if (!queue) {
     queue = { seq: 0, messages: [] };
-    signals.set(c.id, queue);
+    chatMessages.set(c.id, queue);
   }
   queue.seq += 1;
-  queue.messages.push({
-    seq: queue.seq,
-    from,
-    type,
-    data,
-    at: Date.now()
-  });
+  queue.messages.push({ seq: queue.seq, from, text, photo, at: Date.now() });
   // Fila limitada: descarta as mais antigas para nao crescer sem fim.
-  while (queue.messages.length > SIGNAL_MAX_PER_CALL) queue.messages.shift();
+  while (queue.messages.length > CHAT_MAX_PER_CALL) queue.messages.shift();
+  // Mandar mensagem mantem o chamado vivo (como o touch).
+  c.updatedAt = Date.now();
   return res.status(201).json({ ok: true, seq: queue.seq });
 });
 
-// GET /calls/:id/signal — uma ponta busca os sinais novos para ela.
-// Query: for=driver|caller, key=<chave da conta>, since=<seq> (0 = tudo).
-// Devolve so as mensagens da OUTRA ponta com seq > since, em ordem.
-app.get("/calls/:id/signal", (req, res) => {
+app.get("/calls/:id/messages", (req, res) => {
   const c = calls.get(String(req.params.id || ""));
   if (!c) {
     return res
@@ -818,19 +933,19 @@ app.get("/calls/:id/signal", (req, res) => {
     });
   }
   const key = cleanStr(req.query.key, 128);
-  if (!signalParty(c, side, key)) {
+  if (!callParty(c, side, key)) {
     return res.status(403).json({
       error: "not_call_party",
       message: "this key does not belong to a party of this call."
     });
   }
   const since = Number(req.query.since) || 0;
-  const queue = signals.get(c.id);
+  const queue = chatMessages.get(c.id);
   const lastSeq = queue ? queue.seq : 0;
   const messages = [];
   if (queue) {
     for (const m of queue.messages) {
-      if (m.seq > since && m.from !== side) messages.push(signalPublic(m));
+      if (m.seq > since) messages.push(chatPublic(m));
     }
   }
   return res.json({ ok: true, messages, lastSeq });
