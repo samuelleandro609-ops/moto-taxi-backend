@@ -40,12 +40,14 @@
  * aqui: ele expira e e apagado depois de ~30 dias, entao as contas
  * sumiriam sozinhas.
  *
- * Comunicacao na corrida: SO o chat de texto "Converse com o
- * mototaxi" (/calls/:id/messages). O app le em voz alta (voz do
- * Google) o que o OUTRO digitou — nunca a propria mensagem. O VoIP
- * ao vivo (walkie-talkie, WebRTC) foi REMOVIDO (nao funcionou):
- * sem botao de falar, sem codigo WebRTC e sem os endpoints de
- * sinalizacao /calls/:id/signal.
+ * Comunicacao na corrida: SO o chat de AUDIO "Converse com o
+ * mototaxi" (/calls/:id/messages) — audio gravado (nao ao vivo),
+ * mais a foto do local. O texto foi REMOVIDO do chat (o TTS que lia
+ * a mensagem digitada nao funcionou). O VoIP ao vivo (walkie-talkie,
+ * WebRTC) foi REMOVIDO (nao funcionou): sem botao de falar, sem
+ * codigo WebRTC e sem os endpoints de sinalizacao /calls/:id/signal.
+ * A voz de navegacao (turn-by-turn) e o aviso "O destino e..."
+ * continuam — sao separados do chat.
  *
  * v1.5.0: chamado/rota PERSISTE (GET /calls?callerPhone busca o
  * chamado ativo de quem chamou; POST /calls/:id/touch mantem o
@@ -53,8 +55,8 @@
  * cancela — cliente ou moto; TTLs maiores); modo gratuito da diaria
  * (freeFee em /settings — com ele ligado o moto trabalha sem pagar,
  * sem Pix; com ele desligado o Pix vale como antes); chat da corrida
- * (/calls/:id/messages — texto entre cliente e moto, para o app ler
- * em voz alta no outro aparelho). GET /calls?excludeCaller tira o
+ * (/calls/:id/messages — audio gravado e foto entre cliente e moto).
+ * GET /calls?excludeCaller tira o
  * chamado da lista de quem chamou (o chamado so vai para os motos).
  *
  * v1.6.0: a conta da DONA (a primeira registrada, administradora)
@@ -73,6 +75,31 @@
  * dias — a dona escolhe N na Administracao e o valor da diaria so
  * muda se ela mudar. POST /auth/fee passa a calcular o paidUntil no
  * servidor (agora + feeDays * 24h); feeExempt e freeFee nao mudam.
+ *
+ * v1.8.0: chamados em grupo (so para passageiro): POST /calls aceita
+ * os campos opcionais groupId (string, max 128), groupIndex e
+ * groupTotal (inteiro 1 a 5). Um pedido de N motos cria N chamados
+ * com o mesmo groupId, groupIndex 1..N e groupTotal N; cada chamado
+ * continua independente e o aceite continua atomico (o primeiro
+ * aceita, o segundo recebe 409 call_not_pending). Os tres campos
+ * sao devolvidos em callPublic() em todas as respostas de chamado.
+ * Um mototaxi so aceita UM chamado: quem ja tem um chamado aceito
+ * ativo recebe 409 driver_already_has_call ao tentar aceitar outro
+ * (os N chamados vao para N mototaxis diferentes).
+ * Chat so audio (decisao dela): POST /calls/:id/messages aceita
+ * audio gravado (data URL audio/* em base64, max 200000 caracteres,
+ * ate 60 s) e foto; o texto nao e mais enviado pelo app (o TTS do
+ * chat foi removido). A voz de navegacao nao muda.
+ *
+ * v1.8.1: cancelamento pelo MOTOTAXI devolve o chamado para espera —
+ * POST /calls/:id/cancel pelo mototaxi que aceitou (key ==
+ * acceptedBy) num chamado aceito volta o chamado para status
+ * "pending", phase "aguardando", acceptedBy/acceptedName limpos e
+ * devolve returnedToPending: true: o chamado volta a apitar para os
+ * outros mototaxis online aceitarem, o cliente continua vendo como
+ * esperando e o mototaxi fica livre para aceitar outro chamado. O
+ * cancelamento pelo CLIENTE nao muda: cancela o chamado de vez
+ * (status "cancelled").
  */
 
 const express = require("express");
@@ -172,7 +199,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.7.0" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.1" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -481,8 +508,8 @@ const CALL_DONE_TTL_MS = 10 * 60 * 1000; // concluido/cancelado fica visivel por
 // key (chave da conta) -> { key, name, photo, bike, plate, lat, lng, online, updatedAt }
 const presence = new Map();
 // id -> { id, callerName, callerPhone, targetKey, targetName, type, pickup,
-//         destination, amount, status, phase, acceptedBy, acceptedName,
-//         createdAt, updatedAt, completedAt }
+//         destination, amount, groupId, groupIndex, groupTotal, status, phase,
+//         acceptedBy, acceptedName, createdAt, updatedAt, completedAt }
 const calls = new Map();
 let callSeq = 0;
 
@@ -507,6 +534,9 @@ function callPublic(c) {
     pickup: c.pickup,
     destination: c.destination,
     amount: c.amount,
+    groupId: c.groupId !== undefined && c.groupId !== null ? c.groupId : null,
+    groupIndex: c.groupIndex !== undefined && c.groupIndex !== null ? c.groupIndex : 1,
+    groupTotal: c.groupTotal !== undefined && c.groupTotal !== null ? c.groupTotal : 1,
     status: c.status,
     phase: c.phase,
     acceptedBy: c.acceptedBy,
@@ -515,6 +545,23 @@ function callPublic(c) {
     updatedAt: c.updatedAt,
     completedAt: c.completedAt
   };
+}
+
+// Campo de grupo (v1.8.0): devolve undefined quando ausente (null
+// tambem conta como ausente), o inteiro quando veio um valor inteiro
+// (numero, ou string numerica inteira como "3") e null quando veio
+// um valor invalido (fracao, texto nao-numerico, booleano...). O
+// chamador responde 400 invalid_group e nao cria nada.
+function parseGroupInt(v) {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? v : null;
+  }
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v.trim());
+    return Number.isInteger(n) ? n : null;
+  }
+  return null;
 }
 
 function pruneStores() {
@@ -616,7 +663,14 @@ app.get("/presence", (req, res) => {
 
 // POST /calls — cria um chamado. Corpo: { callerName, callerPhone,
 // targetKey (null = para qualquer moto), targetName, type
-// ("corrida"|"entrega"), pickup, destination, amount }.
+// ("corrida"|"entrega"), pickup, destination, amount, groupId?,
+// groupIndex?, groupTotal? } — groupId (string, max 128 caracteres),
+// groupIndex e groupTotal (inteiro 1 a 5) marcam o chamado como parte
+// de um grupo (v1.8.0, so para passageiro: N motos = N chamados com
+// o mesmo groupId, groupIndex 1..N e groupTotal N). Sem os campos,
+// o chamado e avulso: groupId null, groupIndex 1, groupTotal 1.
+// groupTotal ou groupIndex invalido responde 400 invalid_group e
+// nao cria nada.
 app.post("/calls", (req, res) => {
   const body = req.body || {};
   const type = cleanStr(body.type, 20);
@@ -641,6 +695,27 @@ app.post("/calls", (req, res) => {
       message: "amount must be a number >= 0."
     });
   }
+  // Chamado em grupo (v1.8.0): groupTotal tem que ser inteiro de 1 a
+  // 5; groupIndex tem que ser inteiro de 1 ate groupTotal (quando
+  // groupTotal nao veio, vale 1 — entao groupIndex 2 avulso e
+  // invalido). Qualquer valor invalido: 400 e nada e criado.
+  const groupTotalRaw = parseGroupInt(body.groupTotal);
+  if (groupTotalRaw === null || (groupTotalRaw !== undefined && (groupTotalRaw < 1 || groupTotalRaw > 5))) {
+    return res.status(400).json({
+      error: "invalid_group",
+      message: "groupTotal must be an integer from 1 to 5."
+    });
+  }
+  const groupTotal = groupTotalRaw === undefined ? 1 : groupTotalRaw;
+  const groupIndexRaw = parseGroupInt(body.groupIndex);
+  if (groupIndexRaw === null || (groupIndexRaw !== undefined && (groupIndexRaw < 1 || groupIndexRaw > groupTotal))) {
+    return res.status(400).json({
+      error: "invalid_group",
+      message: "groupIndex must be an integer from 1 to groupTotal."
+    });
+  }
+  const groupIndex = groupIndexRaw === undefined ? 1 : groupIndexRaw;
+  const groupId = cleanStr(body.groupId, 128) || null;
   const id =
     "call_" +
     Date.now().toString(36) +
@@ -658,6 +733,9 @@ app.post("/calls", (req, res) => {
     pickup,
     destination,
     amount,
+    groupId,
+    groupIndex,
+    groupTotal,
     status: "pending",
     phase: "aguardando",
     acceptedBy: null,
@@ -718,6 +796,9 @@ app.get("/calls/:id", (req, res) => {
 // { key, name }. So o primeiro aceita (os outros recebem 409 e o
 // chamado some da lista de pendentes deles). Se o chamado foi dirigido
 // a um moto (targetKey), so ele pode aceitar (403 para os demais).
+// Um mototaxi so aceita UM chamado: quem ja tem um chamado aceito
+// ativo recebe 409 driver_already_has_call ("voce ja aceitou um
+// chamado") ao tentar aceitar outro.
 app.post("/calls/:id/accept", (req, res) => {
   const c = calls.get(String(req.params.id || ""));
   if (!c) {
@@ -754,6 +835,25 @@ app.post("/calls/:id/accept", (req, res) => {
       error: "fee_required",
       message: "daily fee is required to accept calls."
     });
+  }
+  // Um mototaxi so aceita UM chamado (v1.8.0): quem ja tem um chamado
+  // aceito ativo nao pode aceitar outro — os N chamados de um pedido
+  // vao para N mototaxis diferentes. Erro distinto do call_not_pending
+  // (caso 1: o chamado ja foi aceito por outro): aqui e o caso 2, o
+  // mototaxi ja tem um chamado ("voce ja aceitou um chamado"). A
+  // checagem fica no mesmo handler, antes de marcar o aceite (atomica).
+  for (const other of calls.values()) {
+    if (
+      other.id !== c.id &&
+      other.status === "accepted" &&
+      other.acceptedBy === key
+    ) {
+      return res.status(409).json({
+        error: "driver_already_has_call",
+        message: "voce ja aceitou um chamado.",
+        call: callPublic(other)
+      });
+    }
   }
   c.status = "accepted";
   c.phase = "a_caminho_coleta";
@@ -822,11 +922,19 @@ app.post("/calls/:id/complete", (req, res) => {
 // POST /calls/:id/cancel — cancela o chamado. Corpo: { key } (id da
 // conta). Pode cancelar: o CLIENTE que chamou (o telefone da conta
 // bate com callerPhone) ou o MOTOTAXI que aceitou (key == acceptedBy).
-// Vale em chamado pendente ou aceito — o cliente cancela desde
-// "procurando mototaxi" e durante toda a espera e a rota. Cancelado
-// fica visivel por 10 min (como concluido) e depois some. Cancelar
-// de novo um chamado ja cancelado/concluido devolve o estado atual
-// (sem erro), para um toque duplo nao quebrar nada.
+// REGRA (v1.8.1): quem cancela muda o resultado — o CLIENTE cancela
+// o chamado de vez (status "cancelled", phase "cancelado", visivel
+// por 10 min); o MOTOTAXI que cancela um chamado aceito DEVOLVE o
+// chamado para espera (status "pending", phase "aguardando",
+// acceptedBy/acceptedName limpos, returnedToPending: true): o chamado
+// volta a apitar para os outros mototaxis online aceitarem e o
+// cliente continua vendo como esperando (procurando mototaxi). O
+// mototaxi fica livre para aceitar outro chamado. Vale em chamado
+// pendente ou aceito — o cliente cancela desde "procurando mototaxi"
+// e durante toda a espera e a rota. Cancelado fica visivel por 10 min
+// (como concluido) e depois some. Cancelar de novo um chamado ja
+// cancelado/concluido devolve o estado atual (sem erro), para um
+// toque duplo nao quebrar nada.
 app.post("/calls/:id/cancel", (req, res) => {
   const c = calls.get(String(req.params.id || ""));
   if (!c) {
@@ -846,6 +954,19 @@ app.post("/calls/:id/cancel", (req, res) => {
       error: "not_call_party",
       message: "only the caller or the driver who accepted can cancel this call."
     });
+  }
+  // Mototaxi cancela um chamado aceito: volta para espera (v1.8.1).
+  // acceptedBy e null em chamado pendente, entao esse ramo so vale
+  // para chamado aceito — pendente cancelado pelo cliente cai no
+  // ramo de baixo, como antes.
+  if (isDriver && c.status === "accepted") {
+    c.status = "pending";
+    c.phase = "aguardando";
+    c.acceptedBy = null;
+    c.acceptedName = null;
+    c.completedAt = null;
+    c.updatedAt = Date.now();
+    return res.json({ ok: true, returnedToPending: true, call: callPublic(c) });
   }
   c.status = "cancelled";
   c.phase = "cancelado";
@@ -916,10 +1037,12 @@ function callParty(call, side, key) {
 // tambem serve para o cliente mandar o ponto de referencia ou o nome
 // da rua quando o GPS nao marcou preciso.
 //
-// POST /calls/:id/messages { from, key, text, photo? } — envia
-// (texto max 500 caracteres; foto opcional, data URL base64 ate
-// 200000 caracteres — o cliente manda foto do local, da casa ou da
-// referencia, e o mototaxi ve no chat dele). GET
+// POST /calls/:id/messages { from, key, audio?, photo?, text? } — envia
+// (audio gravado, data URL audio/* em base64 ate 200000 caracteres,
+// ate 60 s; foto opcional, data URL base64 ate 200000 caracteres —
+// o cliente manda foto do local, da casa ou da referencia, e o
+// mototaxi ve no chat dele; texto ainda aceito pelo servidor por
+// compatibilidade, mas o app nao envia mais texto). GET
 // /calls/:id/messages?for=...&key=...&since=... —
 // devolve TODAS as mensagens com seq > since (das duas pontas, em
 // ordem), para o app remontar a conversa ao reabrir. So as duas
@@ -930,11 +1053,19 @@ function callParty(call, side, key) {
 const CHAT_MAX_PER_CALL = 100;
 const CHAT_MAX_LEN = 500;
 
-// id do chamado -> { seq, messages: [{ seq, from, text, at }] }
+// id do chamado -> { seq, messages: [{ seq, from, text, photo, audio, durationSec, at }] }
 const chatMessages = new Map();
 
 function chatPublic(m) {
-  return { seq: m.seq, from: m.from, text: m.text, photo: m.photo || "", at: m.at };
+  return {
+    seq: m.seq,
+    from: m.from,
+    text: m.text,
+    photo: m.photo || "",
+    audio: m.audio || "",
+    durationSec: m.durationSec || 0,
+    at: m.at
+  };
 }
 
 app.post("/calls/:id/messages", (req, res) => {
@@ -981,10 +1112,32 @@ app.post("/calls/:id/messages", (req, res) => {
       });
     }
   }
-  if (!text && !photo) {
-    return res
-      .status(400)
-      .json({ error: "missing_text", message: "text or photo is required." });
+  // Audio gravado (v1.8.0, chat so audio): o app grava com o
+  // microfone (MediaRecorder, ate 60 s) e manda como data URL
+  // audio/* em base64; max 200000 caracteres (~150 KB) para caber
+  // no limite de 256 KB do corpo JSON. Quem recebe aperta para ouvir.
+  let audio = "";
+  let durationSec = 0;
+  if (typeof body.audio === "string" && body.audio.trim() !== "") {
+    audio = body.audio.trim();
+    if (
+      audio.length > 200000 ||
+      !/^data:audio\/[a-z0-9.+-]+;base64,/.test(audio)
+    ) {
+      return res.status(400).json({
+        error: "invalid_audio",
+        message: "audio must be a data:audio/* base64 URL up to 200000 characters."
+      });
+    }
+    if (typeof body.durationSec === "number" && Number.isFinite(body.durationSec)) {
+      durationSec = Math.max(1, Math.min(60, Math.round(body.durationSec)));
+    }
+  }
+  if (!text && !photo && !audio) {
+    return res.status(400).json({
+      error: "missing_content",
+      message: "audio, photo or text is required."
+    });
   }
   let queue = chatMessages.get(c.id);
   if (!queue) {
@@ -992,7 +1145,15 @@ app.post("/calls/:id/messages", (req, res) => {
     chatMessages.set(c.id, queue);
   }
   queue.seq += 1;
-  queue.messages.push({ seq: queue.seq, from, text, photo, at: Date.now() });
+  queue.messages.push({
+    seq: queue.seq,
+    from,
+    text,
+    photo,
+    audio,
+    durationSec,
+    at: Date.now()
+  });
   // Fila limitada: descarta as mais antigas para nao crescer sem fim.
   while (queue.messages.length > CHAT_MAX_PER_CALL) queue.messages.shift();
   // Mandar mensagem mantem o chamado vivo (como o touch).

@@ -85,6 +85,19 @@ clicar no moto no mapa). Corpo:
 
 `type` é `"corrida"` ou `"entrega"`. Resposta (201): `{ "ok": true, "call": { "id": "call_...", "status": "pending", "phase": "aguardando", ... } }`.
 
+**Chamados em grupo (v1.8.0, só para passageiro):** para pedir N motos
+(máx. 5) o app cria N chamados, um para cada moto, todos com o mesmo
+`groupId` (string, máx. 128 caracteres), `groupIndex` de 1 a N e
+`groupTotal` N. Ex.: 3 motos → 3 chamados com `groupId: "grp-..."`,
+`groupIndex: 1`, `2` e `3`, `groupTotal: 3`. Cada chamado continua
+independente (um aceita e vai, o outro continua pendente) e o aceite
+continua atômico (o primeiro aceita, o segundo recebe 409). Sem os
+campos, o chamado é avulso: `groupId: null`, `groupIndex: 1`,
+`groupTotal: 1`. `groupTotal` fora de 1 a 5 ou `groupIndex` fora de 1
+até `groupTotal` responde **400** `invalid_group` e **não cria nada**.
+Os três campos voltam em todas as respostas que devolvem um chamado
+(criar, listar, detalhe, aceitar, fase, concluir, cancelar, touch).
+
 ### GET /calls
 
 Chamados pendentes (padrão). `?status=all` lista todos;
@@ -125,11 +138,17 @@ aceitou pode concluir (403 para outro).
 
 Cancela o chamado. Corpo: `{ "key": "..." }` (id da conta). Pode
 cancelar: o **cliente** que chamou (o telefone da conta bate com o
-do chamado) ou o **mototáxi** que aceitou. Vale em chamado pendente
-ou aceito — o cliente cancela desde "procurando mototáxi" e durante
-toda a espera e a rota. Cancelado fica visível por 10 min (como
-concluído) e depois some. Cancelar de novo um chamado já cancelado
-ou concluído devolve o estado atual, sem erro.
+do chamado) ou o **mototáxi** que aceitou. Quem cancela muda o
+resultado: o **cliente** cancela o chamado de vez (status
+`"cancelled"`, visível por 10 min e depois some); o **mototáxi** que
+cancela um chamado aceito **devolve o chamado para espera** (status
+`"pending"`, phase `"aguardando"`, sem mototáxi aceito, resposta com
+`returnedToPending: true`) — o chamado volta a apitar para os outros
+mototáxis online aceitarem, o cliente continua vendo como esperando
+e o mototáxi fica livre para aceitar outro chamado. Vale em chamado
+pendente ou aceito — o cliente cancela desde "procurando mototáxi" e
+durante toda a espera e a rota. Cancelar de novo um chamado já
+cancelado ou concluído devolve o estado atual, sem erro.
 
 ### POST /calls/:id/touch
 
@@ -323,7 +342,20 @@ ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.7.0" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.8.1" }`.
+
+## Changelog
+
+- **v1.8.1** — cancelamento pelo mototáxi devolve o chamado para
+  espera: `POST /calls/:id/cancel` pelo mototáxi que aceitou volta o
+  chamado para `"pending"` / `"aguardando"` (com
+  `returnedToPending: true`); o cancelamento pelo cliente continua
+  cancelando o chamado de vez.
+- **v1.8.0** — chamados em grupo (só passageiro): `POST /calls`
+  aceita `groupId`, `groupIndex` e `groupTotal` (1 a 5); os três
+  campos voltam em todas as respostas de chamado; `groupTotal` ou
+  `groupIndex` inválido responde 400 `invalid_group` sem criar nada.
+- **v1.7.0** — dias de validade da diária configuráveis (`feeDays`).
 
 ### POST /create-pix
 
