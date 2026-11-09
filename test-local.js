@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * test-local.js — testes locais do moto-taxi-backend (v1.8.8).
+ * test-local.js — testes locais do moto-taxi-backend (v1.8.9).
  *
  * Sobe o server.js numa porta de teste (PORT=3101) e testa por HTTP.
  * NAO chama nenhum endpoint /auth/* — os testes nunca tocam no
@@ -22,16 +22,16 @@ const PORT = 3101;
 const BASE = "http://127.0.0.1:" + PORT;
 // Arquivo de ajustes do servidor de teste (SETTINGS_FILE): fica no /tmp,
 // nunca no diretorio do repo — o teste apaga no fim.
-const SETTINGS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-1.8.8.json");
+const SETTINGS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-1.8.9.json");
 // Arquivo de contas do servidor de teste (ACCOUNTS_FILE): idem — o
 // teste cria uma conta admin temporaria e apaga no fim.
-const ACCOUNTS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-1.8.8.json");
+const ACCOUNTS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-1.8.9.json");
 const PORT2 = 3102;
 const BASE2 = "http://127.0.0.1:" + PORT2;
 // (s) diaria por conta: arquivos proprios do servidor de teste do
 // /auth/fee (terceira instancia) e porta do mock do Mercado Pago.
-const SETTINGS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-fee-1.8.8.json");
-const ACCOUNTS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-fee-1.8.8.json");
+const SETTINGS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-fee-1.8.9.json");
+const ACCOUNTS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-fee-1.8.9.json");
 const PORT3 = 3104;
 const BASE3 = "http://127.0.0.1:" + PORT3;
 const MOCK_MP_PORT = 3103;
@@ -162,7 +162,7 @@ async function run() {
     // (g) regressao: versao e settings
     console.log("== regressao: versao e settings ==");
     const root = await req("GET", "/");
-    check("GET / retorna version 1.8.8", root.status === 200 && root.data && root.data.version === "1.8.8", JSON.stringify(root.data));
+    check("GET / retorna version 1.8.9", root.status === 200 && root.data && root.data.version === "1.8.9", JSON.stringify(root.data));
     const settings = await req("GET", "/settings");
     check("GET /settings traz feeDays 1", settings.status === 200 && settings.data && settings.data.feeDays === 1, JSON.stringify(settings.data));
 
@@ -1021,6 +1021,75 @@ async function run() {
         // ja apagado ou nunca criado
       }
     }
+
+    // (t) ENTREGA ja coletada: o mototaxi NAO pode cancelar (v1.8.9,
+    // regra dela 09/11) — ele ja esta com o produto e tem que entregar
+    // ate o fim. A caminho da coleta o cancelamento continua valendo
+    // (volta para espera) e a corrida (passageiro) nao muda, nem o
+    // cliente cancelar uma entrega coletada.
+    console.log("== (t) entrega coletada: mototaxi nao cancela, o resto nao muda ==");
+    const t1 = await req("POST", "/calls", baseCall({ callerPhone: "81999990072", type: "entrega", amount: 7 }));
+    const t1id = t1.data.call.id;
+    check("t: entrega criada -> 201 tipo entrega valor 7", t1.status === 201 && t1.data.call.type === "entrega" && t1.data.call.amount === 7, JSON.stringify(t1.data));
+    const ta1 = await req("POST", "/calls/" + t1id + "/accept", { key: "test-key-t1", name: "Moto T1" });
+    check("t: moto T1 aceita a entrega -> 200", ta1.status === 200 && ta1.data.call.status === "accepted", JSON.stringify(ta1.data));
+    // A caminho da coleta: cancelar ainda vale (volta para espera).
+    const tc0 = await req("POST", "/calls/" + t1id + "/cancel", { key: "test-key-t1" });
+    check(
+      "t: moto cancela entrega A CAMINHO da coleta -> 200 volta para espera",
+      tc0.status === 200 && tc0.data.call.status === "pending" && tc0.data.returnedToPending === true,
+      JSON.stringify(tc0.data)
+    );
+    const ta2 = await req("POST", "/calls/" + t1id + "/accept", { key: "test-key-t1", name: "Moto T1" });
+    check("t: moto aceita de novo a mesma entrega -> 200", ta2.status === 200 && ta2.data.call.status === "accepted", JSON.stringify(ta2.data));
+    // A loja confirma a coleta (o mototaxi esta com o produto).
+    const tp1 = await req("POST", "/calls/" + t1id + "/phase", { phase: "coleta_confirmada", key: "test-key-t1" });
+    check("t: fase coleta_confirmada pelo mototaxi -> 200", tp1.status === 200 && tp1.data.call.phase === "coleta_confirmada", JSON.stringify(tp1.data));
+    // Agora o mototaxi NAO pode mais cancelar: 409 e o chamado continua aceito.
+    const tc1 = await req("POST", "/calls/" + t1id + "/cancel", { key: "test-key-t1" });
+    check(
+      "t: moto cancela entrega JA COLETADA -> 409 delivery_already_collected",
+      tc1.status === 409 && tc1.data && tc1.data.error === "delivery_already_collected",
+      "status=" + tc1.status + " " + JSON.stringify(tc1.data)
+    );
+    const tget = await req("GET", "/calls?callerPhone=81999990072");
+    const tseen = (tget.data.calls || []).find((c) => c.id === t1id);
+    check(
+      "t: entrega coletada continua aceita depois do 409",
+      !!tseen && tseen.status === "accepted" && tseen.phase === "coleta_confirmada",
+      JSON.stringify(tget.data)
+    );
+    // E ele ainda consegue concluir (a regra so tira o cancelar).
+    const td1 = await req("POST", "/calls/" + t1id + "/complete", { key: "test-key-t1" });
+    check("t: moto conclui a entrega coletada -> 200", td1.status === 200 && td1.data.call.status === "completed", JSON.stringify(td1.data));
+    // Corrida (passageiro) NAO muda: mesmo coletada, o mototaxi cancela e volta para espera.
+    const t2 = await req("POST", "/calls", baseCall({ callerPhone: "81999990073", type: "corrida" }));
+    const t2id = t2.data.call.id;
+    check("t: corrida criada -> 201 tipo corrida", t2.status === 201 && t2.data.call.type === "corrida", JSON.stringify(t2.data));
+    const ta3 = await req("POST", "/calls/" + t2id + "/accept", { key: "test-key-t2", name: "Moto T2" });
+    check("t: moto T2 aceita a corrida -> 200", ta3.status === 200 && ta3.data.call.status === "accepted", JSON.stringify(ta3.data));
+    const tp2 = await req("POST", "/calls/" + t2id + "/phase", { phase: "coleta_confirmada", key: "test-key-t2" });
+    check("t: fase coleta_confirmada na corrida -> 200", tp2.status === 200 && tp2.data.call.phase === "coleta_confirmada", JSON.stringify(tp2.data));
+    const tc2 = await req("POST", "/calls/" + t2id + "/cancel", { key: "test-key-t2" });
+    check(
+      "t: moto cancela corrida JA COLETADA -> 200 volta para espera (passageiro nao muda)",
+      tc2.status === 200 && tc2.data.call.status === "pending" && tc2.data.returnedToPending === true,
+      JSON.stringify(tc2.data)
+    );
+    // Cliente cancelar entrega coletada NAO muda (cancela de vez, como antes).
+    const t3 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_t3", type: "entrega", amount: 7 }));
+    const t3id = t3.data.call.id;
+    check("t: entrega 3 criada -> 201 tipo entrega", t3.status === 201 && t3.data.call.type === "entrega", JSON.stringify(t3.data));
+    const ta4 = await req("POST", "/calls/" + t3id + "/accept", { key: "test-key-t3", name: "Moto T3" });
+    check("t: moto T3 aceita a entrega -> 200", ta4.status === 200 && ta4.data.call.status === "accepted", JSON.stringify(ta4.data));
+    const tp3 = await req("POST", "/calls/" + t3id + "/phase", { phase: "coleta_confirmada", key: "test-key-t3" });
+    check("t: fase coleta_confirmada na entrega 3 -> 200", tp3.status === 200 && tp3.data.call.phase === "coleta_confirmada", JSON.stringify(tp3.data));
+    const tc3 = await req("POST", "/calls/" + t3id + "/cancel", { key: "acc_test_caller_t3" });
+    check(
+      "t: CLIENTE cancela entrega coletada -> 200 cancelled (cliente nao muda)",
+      tc3.status === 200 && tc3.data.call.status === "cancelled",
+      JSON.stringify(tc3.data)
+    );
   } finally {
     child.kill("SIGTERM");
     await new Promise((r) => setTimeout(r, 300));

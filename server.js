@@ -139,6 +139,14 @@
  * GET /auth/users (e toda resposta com a conta) passa a incluir
  * feeDays (null quando nao definido). MP_API_BASE (env, so para
  * teste local) permite apontar o Mercado Pago para um mock.
+ *
+ * v1.8.9: ENTREGA ja coletada nao pode ser cancelada pelo MOTOTAXI
+ * (regra dela 09/11): POST /calls/:id/cancel pelo mototaxi que aceitou
+ * uma entrega com phase "coleta_confirmada" devolve 409
+ * delivery_already_collected e o chamado continua aceito — ele ja esta
+ * com o produto e tem que entregar ate o fim. A caminho da coleta o
+ * cancelamento continua como antes (volta para espera) e a corrida
+ * (passageiro) nao muda, nem o cancelamento pelo cliente.
  */
 
 const express = require("express");
@@ -244,7 +252,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.8" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.9" });
 });
 
 app.post("/create-pix", requireAuth, async (req, res) => {
@@ -1092,6 +1100,11 @@ app.post("/calls/:id/complete", (req, res) => {
 // (como concluido) e depois some. Cancelar de novo um chamado ja
 // cancelado/concluido devolve o estado atual (sem erro), para um
 // toque duplo nao quebrar nada.
+// REGRA (v1.8.9): excecao — o MOTOTAXI nao pode cancelar uma ENTREGA cuja
+// coleta ja foi confirmada (phase "coleta_confirmada"): ele ja esta com o
+// produto e tem que entregar ate o fim. Recebe 409
+// delivery_already_collected e o chamado continua aceito. Corrida
+// (passageiro) e cancelamento pelo CLIENTE nao mudam.
 app.post("/calls/:id/cancel", (req, res) => {
   const c = calls.get(String(req.params.id || ""));
   if (!c) {
@@ -1110,6 +1123,18 @@ app.post("/calls/:id/cancel", (req, res) => {
     return res.status(403).json({
       error: "not_call_party",
       message: "only the caller or the driver who accepted can cancel this call."
+    });
+  }
+  // REGRA (v1.8.9): o MOTOTAXI nao pode cancelar uma ENTREGA ja coletada —
+  // ele ja esta com o produto e tem que entregar ate o fim. A coleta
+  // confirmada e a phase "coleta_confirmada" no servidor. Vale SO para
+  // entrega; corrida (passageiro) nao muda, e o CLIENTE cancelar nao
+  // muda (cancela de vez, como antes). Um app antigo que tentar recebe
+  // 409 e a viagem continua aceita.
+  if (isDriver && c.type === "entrega" && c.phase === "coleta_confirmada") {
+    return res.status(409).json({
+      error: "delivery_already_collected",
+      message: "delivery already collected: driver cannot cancel after pickup is confirmed."
     });
   }
   // Mototaxi cancela um chamado aceito: volta para espera (v1.8.1).
