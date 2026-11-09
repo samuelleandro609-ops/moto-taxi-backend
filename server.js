@@ -205,7 +205,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.2" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.3" });
 });
 
 app.post("/create-pix", async (req, res) => {
@@ -1012,9 +1012,11 @@ app.post("/calls/:id/touch", (req, res) => {
 // ---------------------------------------------------------------------------
 // Parte do chamado — quem e cada ponta
 //
-// driver: a chave da conta que aceitou o chamado. caller: a conta cujo
-// telefone (so digitos) bate com o telefone do chamado. Usado pelo
-// cancelamento, pelo touch e pelo chat, para so as duas pontas do
+// driver: a chave da conta que aceitou o chamado. caller: a conta que
+// criou o chamado — callerPhone guarda o ID DA CONTA (myKey do app,
+// "acc_..."), nao o telefone; chamado antigo, de antes das contas,
+// guarda o telefone e cai na comparacao por telefone abaixo. Usado
+// pelo cancelamento, pelo touch e pelo chat, para so as duas pontas do
 // chamado agirem nele. (O VoIP ao vivo foi removido: nao funcionou.)
 // ---------------------------------------------------------------------------
 
@@ -1025,6 +1027,22 @@ function callParty(call, side, key) {
     return !!call.acceptedBy && key === call.acceptedBy;
   }
   if (side === "caller") {
+    // BUG (08/11): callerPhone guarda o ID DA CONTA (myKey do app),
+    // nao o telefone — o app cria o chamado com callerPhone=myKey().
+    // O codigo antigo comparava os digitos do id com o telefone da
+    // conta e NUNCA batia: quem chamou levava 403 not_call_party no
+    // chat (enviar e receber audio), no cancelamento e no touch — so
+    // o mototaxi funcionava. A chave que e o proprio id guardado no
+    // chamado e a conta que criou o chamado. O teste direto so vale
+    // para id de conta ("acc_..."): chamado antigo com telefone no
+    // callerPhone continua exigindo a conta cujo telefone bate.
+    if (
+      typeof call.callerPhone === "string" &&
+      call.callerPhone.indexOf("acc_") === 0 &&
+      key === call.callerPhone
+    ) {
+      return true;
+    }
     const acc = findAccountById(key);
     if (!acc || !acc.phone) return false;
     return normalizePhone(call.callerPhone) === acc.phone;
@@ -1533,6 +1551,27 @@ app.post("/auth/logout", requireAuth, (req, res) => {
   if (m) {
     authStore.tokens = authStore.tokens.filter((t) => t.token !== m[1].trim());
     saveAuthStore();
+  }
+  // Sair cancela os chamados PENDENTES desta conta (08/11): pedido
+  // abandonado nao fica apitando "Chamado solicitado" na proxima conta
+  // nem nos outros mototaxis como chamado antigo da versao anterior.
+  // Chamado ja aceito/em rota nao e tocado — ele continua e volta ao
+  // reentrar. O app tambem cancela os pendentes antes de sair; isto
+  // aqui e a rede de seguranca para quando o pedido do app nao chega.
+  if (req.account) {
+    const now = Date.now();
+    for (const c of calls.values()) {
+      if (c.status !== "pending") continue;
+      const mine =
+        c.callerPhone === req.account.id ||
+        (req.account.phone &&
+          normalizePhone(c.callerPhone) === req.account.phone);
+      if (!mine) continue;
+      c.status = "cancelled";
+      c.phase = "cancelado";
+      c.completedAt = now;
+      c.updatedAt = now;
+    }
   }
   return res.json({ ok: true });
 });
