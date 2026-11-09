@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * test-local.js — testes locais do moto-taxi-backend (v1.8.3).
+ * test-local.js — testes locais do moto-taxi-backend (v1.8.6).
  *
  * Sobe o server.js numa porta de teste (PORT=3101) e testa por HTTP.
  * NAO chama nenhum endpoint /auth/* — os testes nunca tocam no
@@ -14,9 +14,19 @@
 
 const { spawn } = require("child_process");
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
 
 const PORT = 3101;
 const BASE = "http://127.0.0.1:" + PORT;
+// Arquivo de ajustes do servidor de teste (SETTINGS_FILE): fica no /tmp,
+// nunca no diretorio do repo — o teste apaga no fim.
+const SETTINGS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-1.8.5.json");
+// Arquivo de contas do servidor de teste (ACCOUNTS_FILE): idem — o
+// teste cria uma conta admin temporaria e apaga no fim.
+const ACCOUNTS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-1.8.5.json");
+const PORT2 = 3102;
+const BASE2 = "http://127.0.0.1:" + PORT2;
 
 let passed = 0;
 let failed = 0;
@@ -33,10 +43,29 @@ function check(name, cond, extra) {
   }
 }
 
-async function req(method, p, body) {
-  const resp = await fetch(BASE + p, {
+async function reqBase(base, method, p, body) {
+  const resp = await fetch(base + p, {
     method,
     headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    data = null;
+  }
+  return { status: resp.status, data };
+}
+
+async function req(method, p, body) {
+  return reqBase(BASE, method, p, body);
+}
+
+async function reqAuth(token, method, p, body) {
+  const resp = await fetch(BASE + p, {
+    method,
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   let data = null;
@@ -64,11 +93,11 @@ function baseCall(overrides) {
   );
 }
 
-async function waitReady(child) {
+async function waitReadyBase(base) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
-      const r = await req("GET", "/");
+      const r = await reqBase(base, "GET", "/");
       if (r.status === 200 && r.data && r.data.ok) return true;
     } catch (e) {
       // servidor ainda subindo
@@ -78,9 +107,28 @@ async function waitReady(child) {
   return false;
 }
 
+async function waitReady(child) {
+  return waitReadyBase(BASE);
+}
+
 async function run() {
+  try {
+    fs.unlinkSync(SETTINGS_TEST_FILE);
+  } catch (e) {
+    // nao existia: nada a limpar
+  }
+  try {
+    fs.unlinkSync(ACCOUNTS_TEST_FILE);
+  } catch (e) {
+    // nao existia: nada a limpar
+  }
   const child = spawn(process.execPath, [path.join(__dirname, "server.js")], {
-    env: Object.assign({}, process.env, { PORT: String(PORT) }),
+    env: Object.assign({}, process.env, {
+      PORT: String(PORT),
+      SETTINGS_FILE: SETTINGS_TEST_FILE,
+      ACCOUNTS_FILE: ACCOUNTS_TEST_FILE,
+      MP_ACCESS_TOKEN: "" // sem token do Mercado Pago: /auth/fee e /create-pix respondem 503 de forma deterministica
+    }),
     stdio: ["ignore", "pipe", "pipe"]
   });
   let serverOut = "";
@@ -102,7 +150,7 @@ async function run() {
     // (g) regressao: versao e settings
     console.log("== regressao: versao e settings ==");
     const root = await req("GET", "/");
-    check("GET / retorna version 1.8.3", root.status === 200 && root.data && root.data.version === "1.8.3", JSON.stringify(root.data));
+    check("GET / retorna version 1.8.6", root.status === 200 && root.data && root.data.version === "1.8.6", JSON.stringify(root.data));
     const settings = await req("GET", "/settings");
     check("GET /settings traz feeDays 1", settings.status === 200 && settings.data && settings.data.feeDays === 1, JSON.stringify(settings.data));
 
@@ -253,7 +301,7 @@ async function run() {
     const c1id = c1.data.call.id;
     const a1 = await req("POST", "/calls/" + c1id + "/accept", { key: "test-key-1", name: "Moto 1" });
     check("fluxo: accept devolve 200 accepted", a1.status === 200 && a1.data.call.status === "accepted", JSON.stringify(a1.data));
-    const ph = await req("POST", "/calls/" + c1id + "/phase", { phase: "coleta_confirmada" });
+    const ph = await req("POST", "/calls/" + c1id + "/phase", { key: "test-key-1", phase: "coleta_confirmada" });
     check(
       "fluxo: phase devolve 200 com a fase e os campos do grupo",
       ph.status === 200 && ph.data.call.phase === "coleta_confirmada" && ph.data.call.groupTotal === 1,
@@ -491,10 +539,162 @@ async function run() {
       kx3.status === 403 && kx3.data && kx3.data.error === "not_call_party",
       "status=" + kx3.status + " " + JSON.stringify(kx3.data)
     );
+    // (l) ajustes: carimbo fresco na subida e ida-e-volta do gratis
+    console.log("== (l) ajustes: settingsAt fresco e gratis ida-e-volta ==");
+    // Conta admin temporaria (a 1a conta vira admin): POST /settings
+    // exige admin desde a v1.8.5 — sem token, responde 401.
+    const adminReg = await req("POST", "/auth/register", { name: "Admin Teste", phone: "81999990001", password: "teste1234", role: "mototaxi" });
+    check("l: registrar a 1a conta (admin) -> 201 com token", adminReg.status === 201 && adminReg.data && !!adminReg.data.token && adminReg.data.account && adminReg.data.account.isAdmin === true, JSON.stringify(adminReg.data));
+    const adminToken = adminReg.data && adminReg.data.token;
+    const st0 = await req("GET", "/settings");
+    check(
+      "l: GET /settings traz settingsAt > 0 (nunca 0) e freeFee booleano",
+      st0.status === 200 && st0.data && typeof st0.data.settingsAt === "number" && st0.data.settingsAt > 0 && typeof st0.data.freeFee === "boolean",
+      JSON.stringify(st0.data)
+    );
+    const stFreeOn = await reqAuth(adminToken, "POST", "/settings", { freeFee: true, settingsAt: Date.now() });
+    check("l: POST /settings freeFee true (com token admin) -> 200", stFreeOn.status === 200 && stFreeOn.data && stFreeOn.data.ok === true, JSON.stringify(stFreeOn.data));
+    const st1 = await req("GET", "/settings");
+    check("l: GET /settings mostra freeFee true depois do POST", st1.status === 200 && st1.data && st1.data.freeFee === true, JSON.stringify(st1.data));
+    check("l: settings.json foi gravado no disco", fs.existsSync(SETTINGS_TEST_FILE), SETTINGS_TEST_FILE);
+    const stFreeOff = await reqAuth(adminToken, "POST", "/settings", { freeFee: false, settingsAt: Date.now() });
+    check("l: POST /settings freeFee false (com token admin) -> 200", stFreeOff.status === 200 && stFreeOff.data && stFreeOff.data.ok === true, JSON.stringify(stFreeOff.data));
+    const st2 = await req("GET", "/settings");
+    check("l: GET /settings mostra freeFee false depois do POST", st2.status === 200 && st2.data && st2.data.freeFee === false, JSON.stringify(st2.data));
+
+    // (m) ajustes persistem no reinicio: outro processo com o mesmo arquivo ve o gratis
+    console.log("== (m) ajustes persistem no reinicio ==");
+    await reqAuth(adminToken, "POST", "/settings", { freeFee: true, settingsAt: Date.now() });
+    const child2 = spawn(process.execPath, [path.join(__dirname, "server.js")], {
+      env: Object.assign({}, process.env, { PORT: String(PORT2), SETTINGS_FILE: SETTINGS_TEST_FILE, ACCOUNTS_FILE: ACCOUNTS_TEST_FILE, MP_ACCESS_TOKEN: "" }),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    try {
+      const ready2 = await waitReadyBase(BASE2);
+      check("m: segundo servidor sobe na porta " + PORT2, ready2 === true);
+      const st3 = await reqBase(BASE2, "GET", "/settings");
+      check(
+        "m: servidor reiniciado le settings.json e devolve freeFee true",
+        st3.status === 200 && st3.data && st3.data.freeFee === true,
+        JSON.stringify(st3.data)
+      );
+    } finally {
+      child2.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 300));
+      if (!child2.killed) child2.kill("SIGKILL");
+    }
+
+    // (n) chamado aceito NUNCA volta aos pendentes — para ninguem, nem depois da coleta
+    console.log("== (n) aceito nunca volta aos pendentes ==");
+    const n1 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_n1" }));
+    const n1id = n1.data.call.id;
+    const na1 = await req("POST", "/calls/" + n1id + "/accept", { key: "test-key-n1", name: "Moto N1" });
+    check("n: aceite -> 200 accepted", na1.status === 200 && na1.data.call.status === "accepted", JSON.stringify(na1.data));
+    const nPend = await req("GET", "/calls");
+    check("n: aceito nao esta em GET /calls (pendentes)", !(nPend.data.calls || []).some((c) => c.id === n1id), JSON.stringify(nPend.data));
+    const nPendOther = await req("GET", "/calls?excludeCaller=acc_test_outro_qualquer");
+    check(
+      "n: aceito nao esta em GET /calls?excludeCaller=<outro> — nenhum outro mototaxi o ve pendente",
+      !(nPendOther.data.calls || []).some((c) => c.id === n1id),
+      JSON.stringify(nPendOther.data)
+    );
+    const nAll = await req("GET", "/calls?status=all");
+    const nFound = (nAll.data.calls || []).find((c) => c.id === n1id);
+    check("n: aceito continua em GET /calls?status=all com status accepted", !!nFound && nFound.status === "accepted", JSON.stringify(nFound));
+    const nPh = await req("POST", "/calls/" + n1id + "/phase", { key: "test-key-n1", phase: "coleta_confirmada" });
+    check(
+      "n: phase coleta_confirmada -> 200 e o status continua accepted (a coleta nao devolve o chamado para espera)",
+      nPh.status === 200 && nPh.data.call.status === "accepted" && nPh.data.call.phase === "coleta_confirmada",
+      JSON.stringify(nPh.data)
+    );
+    const nPend2 = await req("GET", "/calls");
+    check("n: depois da coleta confirmada, o aceito segue fora dos pendentes", !(nPend2.data.calls || []).some((c) => c.id === n1id), JSON.stringify(nPend2.data));
+
+    // (o) seguranca: /settings e /auth/fee exigem autenticacao; /auth/fee exige pagamento
+    console.log("== (o) seguranca: ajustes e diaria exigem auth e pagamento ==");
+    const oNoAuth = await req("POST", "/settings", { freeFee: true, settingsAt: Date.now() });
+    check("o: POST /settings sem token -> 401 (qualquer um na internet nao liga o gratis)", oNoAuth.status === 401, JSON.stringify(oNoAuth.data));
+    const userReg = await req("POST", "/auth/register", { name: "Usuario Teste", phone: "81999990002", password: "teste1234", role: "passageiro" });
+    check("o: registrar a 2a conta (nao-admin) -> 201 com token", userReg.status === 201 && userReg.data && !!userReg.data.token && userReg.data.account && userReg.data.account.isAdmin === false, JSON.stringify(userReg.data));
+    const userToken = userReg.data && userReg.data.token;
+    const oNonAdmin = await reqAuth(userToken, "POST", "/settings", { freeFee: true, settingsAt: Date.now() });
+    check("o: POST /settings com token de nao-admin -> 403", oNonAdmin.status === 403, JSON.stringify(oNonAdmin.data));
+    const oFeeNoPay = await reqAuth(adminToken, "POST", "/auth/fee", {});
+    check("o: POST /auth/fee sem payment_id -> 400 (diaria nao libera sem pagamento)", oFeeNoPay.status === 400 && oFeeNoPay.data && oFeeNoPay.data.error === "missing_payment_id", JSON.stringify(oFeeNoPay.data));
+    const oFeeNoMp = await reqAuth(adminToken, "POST", "/auth/fee", { payment_id: "99999999999" });
+    check("o: POST /auth/fee com payment_id mas sem token do Mercado Pago -> 503 (nao libera sem conferir)", oFeeNoMp.status === 503, JSON.stringify(oFeeNoMp.data));
+    const oPixNoAuth = await req("POST", "/create-pix", { amount: 5, description: "x", external_ref: "diaria-teste-1", payer_email: "a@b.com" });
+    check("o: POST /create-pix sem token -> 401", oPixNoAuth.status === 401, JSON.stringify(oPixNoAuth.data));
+    const oPayNoAuth = await req("GET", "/payment/99999999999");
+    check("o: GET /payment/:id sem token -> 401", oPayNoAuth.status === 401, JSON.stringify(oPayNoAuth.data));
+
+    // (p) seguranca das fases e da conclusao (B10/B11/B12) + fase "chegou" (E3) + busy na presenca (B3)
+    console.log("== (p) fase exige parte, complete exige chave, autor nao aceita o proprio chamado ==");
+    // Quem chama usa o id da conta como callerPhone (igual ao app: callerPhone=myKey()).
+    // Sem conta registrada, o servidor nao reconhece o autor como parte (403 not_call_party).
+    const pCallerReg = await req("POST", "/auth/register", { name: "Chamador Teste", phone: "81999990003", password: "teste1234", role: "passageiro" });
+    check("p: registrar conta de quem chama -> 201 com id", pCallerReg.status === 201 && pCallerReg.data && pCallerReg.data.account && !!pCallerReg.data.account.id, JSON.stringify(pCallerReg.data));
+    const pCallerKey = pCallerReg.data.account.id;
+    const p1 = await req("POST", "/calls", baseCall({ callerPhone: pCallerKey }));
+    const p1id = p1.data.call.id;
+    const pa1 = await req("POST", "/calls/" + p1id + "/accept", { key: "test-key-p1", name: "Moto P1" });
+    check("p: aceite -> 200 accepted", pa1.status === 200 && pa1.data.call.status === "accepted", JSON.stringify(pa1.data));
+    const pNoKey = await req("POST", "/calls/" + p1id + "/phase", { phase: "coleta_confirmada" });
+    check("p: phase sem key -> 400 missing_key", pNoKey.status === 400 && pNoKey.data && pNoKey.data.error === "missing_key", JSON.stringify(pNoKey.data));
+    const pStranger = await req("POST", "/calls/" + p1id + "/phase", { key: "test-key-estranho", phase: "coleta_confirmada" });
+    check("p: phase de quem nao e parte -> 403 not_call_party", pStranger.status === 403 && pStranger.data && pStranger.data.error === "not_call_party", JSON.stringify(pStranger.data));
+    const pBadPhase = await req("POST", "/calls/" + p1id + "/phase", { key: "test-key-p1", phase: "fase_que_nao_existe" });
+    check("p: phase desconhecida -> 400 invalid_phase", pBadPhase.status === 400 && pBadPhase.data && pBadPhase.data.error === "invalid_phase", JSON.stringify(pBadPhase.data));
+    const pChegouDriver = await req("POST", "/calls/" + p1id + "/phase", { key: "test-key-p1", phase: "chegou" });
+    check("p: phase chegou do mototaxi -> 200 com a fase", pChegouDriver.status === 200 && pChegouDriver.data.call.phase === "chegou", JSON.stringify(pChegouDriver.data));
+    const pChegouCaller = await req("POST", "/calls/" + p1id + "/phase", { key: pCallerKey, phase: "chegou" });
+    check("p: phase chegou de quem chamou -> 200 (as duas pontas podem mudar a fase)", pChegouCaller.status === 200 && pChegouCaller.data.call.phase === "chegou", JSON.stringify(pChegouCaller.data));
+    const pColetaCaller = await req("POST", "/calls/" + p1id + "/phase", { key: pCallerKey, phase: "coleta_confirmada" });
+    check("p: phase coleta_confirmada de quem chamou -> 200", pColetaCaller.status === 200 && pColetaCaller.data.call.phase === "coleta_confirmada", JSON.stringify(pColetaCaller.data));
+    const p2 = await req("POST", "/calls", baseCall({ callerPhone: pCallerKey }));
+    const p2id = p2.data.call.id;
+    const pCancel = await req("POST", "/calls/" + p2id + "/cancel", { key: pCallerKey });
+    check("p: cancel de quem chamou -> 200 cancelled", pCancel.status === 200 && pCancel.data.call.status === "cancelled", JSON.stringify(pCancel.data));
+    const pPhaseCancelled = await req("POST", "/calls/" + p2id + "/phase", { key: pCallerKey, phase: "chegou" });
+    check("p: phase em chamado cancelado -> 409 call_cancelled", pPhaseCancelled.status === 409 && pPhaseCancelled.data && pPhaseCancelled.data.error === "call_cancelled", JSON.stringify(pPhaseCancelled.data));
+    const pNoKeyComplete = await req("POST", "/calls/" + p1id + "/complete", {});
+    check("p: complete sem key -> 400 missing_key", pNoKeyComplete.status === 400 && pNoKeyComplete.data && pNoKeyComplete.data.error === "missing_key", JSON.stringify(pNoKeyComplete.data));
+    const pEmptyKeyComplete = await req("POST", "/calls/" + p1id + "/complete", { key: "" });
+    check("p: complete com key vazia -> 400 missing_key", pEmptyKeyComplete.status === 400 && pEmptyKeyComplete.data && pEmptyKeyComplete.data.error === "missing_key", JSON.stringify(pEmptyKeyComplete.data));
+    const pDone = await req("POST", "/calls/" + p1id + "/complete", { key: "test-key-p1" });
+    check("p: complete do mototaxi que aceitou -> 200 completed", pDone.status === 200 && pDone.data.call.status === "completed", JSON.stringify(pDone.data));
+    const p3 = await req("POST", "/calls", baseCall());
+    const p3id = p3.data.call.id;
+    const pOwnAccept = await req("POST", "/calls/" + p3id + "/accept", { key: "81999990000", name: "Teste" });
+    check("p: autor do chamado nao aceita o proprio chamado -> 403 cannot_accept_own_call", pOwnAccept.status === 403 && pOwnAccept.data && pOwnAccept.data.error === "cannot_accept_own_call", JSON.stringify(pOwnAccept.data));
+    const pBusy1 = await req("POST", "/presence", { key: "test-key-busy1", name: "Moto Busy", lat: -7.5, lng: -35.3, online: true, busy: true });
+    check("p: presence com busy:true -> 200", pBusy1.status === 200 && pBusy1.data && pBusy1.data.online === true, JSON.stringify(pBusy1.data));
+    const pBusy2 = await req("POST", "/presence", { key: "test-key-busy2", name: "Moto Livre", lat: -7.5, lng: -35.3, online: true });
+    check("p: presence sem busy -> 200", pBusy2.status === 200 && pBusy2.data && pBusy2.data.online === true, JSON.stringify(pBusy2.data));
+    const pPres = await req("GET", "/presence");
+    const pBusyFound = (pPres.data.drivers || []).find((d) => d.key === "test-key-busy1");
+    const pFreeFound = (pPres.data.drivers || []).find((d) => d.key === "test-key-busy2");
+    check("p: GET /presence devolve busy:true para quem esta em servico", !!pBusyFound && pBusyFound.busy === true, JSON.stringify(pBusyFound));
+    check("p: GET /presence devolve busy:false para quem nao mandou busy", !!pFreeFound && pFreeFound.busy === false, JSON.stringify(pFreeFound));
   } finally {
     child.kill("SIGTERM");
     await new Promise((r) => setTimeout(r, 300));
     if (!child.killed) child.kill("SIGKILL");
+    try {
+      fs.unlinkSync(SETTINGS_TEST_FILE);
+    } catch (e) {
+      // ja apagado ou nunca criado
+    }
+    try {
+      fs.unlinkSync(ACCOUNTS_TEST_FILE);
+    } catch (e) {
+      // ja apagado ou nunca criado
+    }
+    try {
+      fs.unlinkSync(ACCOUNTS_TEST_FILE + ".tmp");
+    } catch (e) {
+      // ja apagado ou nunca criado
+    }
   }
 
   console.log("\n" + passed + " passaram, " + failed + " falharam.");

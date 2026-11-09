@@ -205,10 +205,10 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.3" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.6" });
 });
 
-app.post("/create-pix", async (req, res) => {
+app.post("/create-pix", requireAuth, async (req, res) => {
   if (!mpToken()) return tokenNotConfigured(res);
 
   const body = req.body || {};
@@ -268,6 +268,11 @@ app.post("/create-pix", async (req, res) => {
     const d = result.data || {};
     const tx =
       (d.point_of_interaction && d.point_of_interaction.transaction_data) || {};
+    // Registra a cobranca (valor + valor da diaria na hora): o /auth/fee
+    // confere o pagamento contra isto, e nao contra um valor mandado
+    // pelo aparelho.
+    prunePixCharges();
+    pixCharges.set(external_ref, { amount, fee: appSettings.fee, createdAt: Date.now() });
     return res.status(201).json({
       id: d.id,
       status: d.status,
@@ -284,7 +289,7 @@ app.post("/create-pix", async (req, res) => {
   }
 });
 
-app.get("/payment/:id", async (req, res) => {
+app.get("/payment/:id", requireAuth, async (req, res) => {
   if (!mpToken()) return tokenNotConfigured(res);
 
   const id = String(req.params.id || "").trim();
@@ -339,6 +344,60 @@ app.get("/payment/:id", async (req, res) => {
 
 const DEFAULT_SETTINGS = { ride: 8, delivery: 7, fee: 5, freeFee: false, feeDays: 1 };
 let appSettings = { ...DEFAULT_SETTINGS, settingsAt: 0 };
+
+// Persistencia dos ajustes (v1.8.4): settings.json ao lado do server.js,
+// escrita atomica (tmp + rename), mesmo padrao do accounts.json. Sem isto,
+// o freeFee e os valores viviam SO na memoria: quando o Render Free
+// dormia/reiniciava, tudo voltava para o padrao (freeFee=false) e a
+// Administracao continuava mostrando "ativado" — o servidor bloqueava
+// conta nova por falta de diaria (402) mesmo com o gratis "ligado" na
+// tela, e a dona tinha que desligar e ligar de novo para liberar. Com o
+// arquivo, o gratis sobrevive ao sono (o disco persiste na suspensao);
+// num redeploy (disco apagado) volta ao padrao, mas o carimbo abaixo faz
+// os aparelhos aplicarem o reset em vez de divergirem.
+const SETTINGS_FILE =
+  process.env.SETTINGS_FILE || path.join(__dirname, "settings.json");
+
+function loadAppSettings() {
+  try {
+    if (!fs.existsSync(SETTINGS_FILE)) {
+      // Sem arquivo (1a subida ou disco apagado no redeploy): carimbo
+      // FRESCO, nao 0 — assim os aparelhos aplicam o reset (padrao) em
+      // vez de ignorarem um carimbo 0 e manterem um gratis que o
+      // servidor nao tem mais.
+      appSettings.settingsAt = Date.now();
+      return;
+    }
+    const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object") {
+      if (typeof data.ride === "number" && data.ride >= 0) appSettings.ride = data.ride;
+      if (typeof data.delivery === "number" && data.delivery >= 0) appSettings.delivery = data.delivery;
+      if (typeof data.fee === "number" && data.fee >= 0) appSettings.fee = data.fee;
+      if (typeof data.feeDays === "number" && Number.isInteger(data.feeDays) && data.feeDays >= 1)
+        appSettings.feeDays = data.feeDays;
+      if (typeof data.freeFee === "boolean") appSettings.freeFee = data.freeFee;
+      if (typeof data.settingsAt === "number" && data.settingsAt > 0) appSettings.settingsAt = data.settingsAt;
+      else appSettings.settingsAt = Date.now();
+    } else {
+      console.log("settings.json invalido (formato inesperado); comecando com os padroes.");
+      appSettings.settingsAt = Date.now();
+    }
+  } catch (err) {
+    console.log("nao foi possivel ler settings.json (" + err.message + "); comecando com os padroes.");
+    appSettings.settingsAt = Date.now();
+  }
+}
+
+function saveAppSettings() {
+  try {
+    const tmp = SETTINGS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(appSettings), "utf8");
+    fs.renameSync(tmp, SETTINGS_FILE);
+  } catch (err) {
+    console.log("nao foi possivel gravar settings.json: " + err.message);
+  }
+}
 
 // Dias de validade da diaria (v1.7.0): UM pagamento do valor da diaria
 // vale por feeDays dias — a dona escolhe N na Administracao (padrao 1,
@@ -451,7 +510,7 @@ app.get("/settings", (req, res) => {
 // POST /settings — a Administracao grava os valores novos. Corpo com os
 // valores e settingsAt (carimbo). So vale se o carimbo for mais recente
 // que o guardado; um POST mais antigo nao sobrescreve o mais novo.
-app.post("/settings", (req, res) => {
+app.post("/settings", requireAuth, requireAdmin, (req, res) => {
   const body = req.body || {};
   const ride = pickNumber(body, ["ride", "ridePrice", "priceRide", "corrida", "ride_value"]);
   const delivery = pickNumber(body, ["delivery", "deliveryPrice", "priceDelivery", "entrega", "delivery_value"]);
@@ -485,6 +544,7 @@ app.post("/settings", (req, res) => {
   if (feeDays !== undefined) appSettings.feeDays = feeDays;
   if (freeFee !== undefined) appSettings.freeFee = freeFee;
   appSettings.settingsAt = incomingAt;
+  saveAppSettings(); // persiste na hora: o gratis e os valores sobrevivem ao sono do Render Free
   return res.json({ ok: true, ...settingsPublic() });
 });
 
@@ -518,6 +578,19 @@ const presence = new Map();
 //         acceptedBy, acceptedName, createdAt, updatedAt, completedAt }
 const calls = new Map();
 let callSeq = 0;
+
+// Cobrancas Pix da diaria ja criadas (external_ref -> {amount, fee,
+// createdAt}): o /auth/fee confere o pagamento contra o valor cobrado e
+// contra o valor da diaria na hora da cobranca, para ninguem liberar a
+// diaria com um pagamento de outro valor. Some com o reinicio (o
+// /auth/fee cai para o valor atual da diaria nesse caso).
+const pixCharges = new Map();
+function prunePixCharges() {
+  const now = Date.now();
+  pixCharges.forEach((v, k) => {
+    if (now - (v.createdAt || 0) > 24 * 3600 * 1000) pixCharges.delete(k);
+  });
+}
 
 function cleanStr(v, max) {
   if (typeof v !== "string") return "";
@@ -592,7 +665,9 @@ setInterval(pruneStores, 10000).unref();
 
 // POST /presence — heartbeat do mototaxi (chamado a cada poucos segundos
 // enquanto ele esta online). Corpo: { key, name, photo, bike, plate, lat,
-// lng, online }. online=false tira o moto da lista na hora. Se photo
+// lng, online, busy }. online=false tira o moto da lista na hora. busy=true
+// diz que ele esta em servico (com viagem ativa) — o app le de volta no
+// GET /presence para mostrar "Em servico" nos outros aparelhos. Se photo
 // vier vazia, mantem a foto do heartbeat anterior.
 app.post("/presence", (req, res) => {
   const body = req.body || {};
@@ -642,6 +717,7 @@ app.post("/presence", (req, res) => {
     lat,
     lng,
     online: true,
+    busy: body.busy === true,
     updatedAt: Date.now()
   });
   return res.json({ ok: true, online: true, key });
@@ -661,6 +737,7 @@ app.get("/presence", (req, res) => {
       plate: p.plate,
       lat: p.lat,
       lng: p.lng,
+      busy: p.busy === true,
       updatedAt: p.updatedAt
     });
   }
@@ -826,6 +903,15 @@ app.post("/calls/:id/accept", (req, res) => {
       .status(400)
       .json({ error: "missing_key", message: "key is required." });
   }
+  // Ninguem aceita o proprio chamado: as guardas existiam so no app
+  // (a lista filtrava), mas a API aceitava — com duas contas, o autor
+  // do chamado podia aceita-lo.
+  if (key === c.callerPhone) {
+    return res.status(403).json({
+      error: "cannot_accept_own_call",
+      message: "you cannot accept your own call."
+    });
+  }
   if (c.targetKey && c.targetKey !== key) {
     return res.status(403).json({
       error: "not_targeted_driver",
@@ -886,12 +972,43 @@ app.post("/calls/:id/phase", (req, res) => {
       call: callPublic(c)
     });
   }
+  if (c.status === "cancelled" || c.status === "canceled") {
+    return res.status(409).json({
+      error: "call_cancelled",
+      message: "call is cancelled.",
+      call: callPublic(c)
+    });
+  }
   const body = req.body || {};
+  const key = cleanStr(body.key, 128);
+  if (!key) {
+    return res
+      .status(400)
+      .json({ error: "missing_key", message: "key is required." });
+  }
+  // So as duas pontas (quem chamou ou o mototaxi que aceitou) podem
+  // mudar a fase — antes, qualquer um com o id do chamado confirmava a
+  // coleta, gravava "cancelada" num chamado aceito ou qualquer outra
+  // fase, e cada POST renovava o TTL do chamado.
+  const isDriver = callParty(c, "driver", key);
+  const isCaller = callParty(c, "caller", key);
+  if (!isDriver && !isCaller) {
+    return res.status(403).json({
+      error: "not_call_party",
+      message: "only the caller or the driver who accepted can change the phase."
+    });
+  }
   const phase = cleanStr(body.phase, 40);
   if (!phase) {
     return res
       .status(400)
       .json({ error: "missing_phase", message: "phase is required." });
+  }
+  const knownPhases = ["coleta_confirmada", "a_caminho_entrega", "cancelada", "aguardando", "concluido", "cancelado", "chegou"];
+  if (knownPhases.indexOf(phase) < 0) {
+    return res
+      .status(400)
+      .json({ error: "invalid_phase", message: "unknown phase." });
   }
   c.phase = phase;
   c.updatedAt = Date.now();
@@ -912,6 +1029,11 @@ app.post("/calls/:id/complete", (req, res) => {
   }
   const body = req.body || {};
   const key = cleanStr(body.key, 128);
+  if (!key) {
+    return res
+      .status(400)
+      .json({ error: "missing_key", message: "key is required." });
+  }
   if (c.acceptedBy && key && c.acceptedBy !== key) {
     return res.status(403).json({
       error: "not_accepted_driver",
@@ -1265,10 +1387,11 @@ app.get("/calls/:id/messages", (req, res) => {
 // POST /calls/:id/accept (402 fee_required sem diaria valida).
 // ---------------------------------------------------------------------------
 
-const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
+const ACCOUNTS_FILE =
+  process.env.ACCOUNTS_FILE || path.join(__dirname, "accounts.json");
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // sessao vale 30 dias
 
-let authStore = { version: 1, accounts: [], tokens: [] };
+let authStore = { version: 1, accounts: [], tokens: [], usedFeePayments: {} };
 
 function loadAuthStore() {
   try {
@@ -1277,6 +1400,7 @@ function loadAuthStore() {
     const data = JSON.parse(raw);
     if (data && Array.isArray(data.accounts) && Array.isArray(data.tokens)) {
       authStore = data;
+      if (!authStore.usedFeePayments || typeof authStore.usedFeePayments !== "object") authStore.usedFeePayments = {};
       pruneTokens();
       normalizeFeeExempt();
     } else {
@@ -1597,18 +1721,100 @@ app.post("/auth/change-password", requireAuth, (req, res) => {
 // POST /auth/fee — registra a diaria paga na conta (para valer em
 // qualquer aparelho). O paidUntil e calculado NO SERVIDOR: agora +
 // feeDays * 24h (v1.7.0 — antes o app mandava paidUntil de 24h fixo
-// e o servidor so guardava; agora a duracao segue o que a dona
-// escolheu na Administracao). UM pagamento do valor da diaria vale
-// por feeDays dias. So aumenta, nunca diminui: se a conta ja tem um
-// paidUntil maior, ele fica. O app chama depois de confirmar o Pix
-// pago; o corpo nao precisa de nada (um paidUntil mandado pelo app
-// e ignorado). feeExempt (dona) e freeFee nao passam por aqui.
-app.post("/auth/fee", requireAuth, (req, res) => {
-  const paidUntil = Date.now() + appSettings.feeDays * 24 * 3600 * 1000;
-  if (paidUntil > (req.account.paidUntil || 0)) {
-    req.account.paidUntil = paidUntil;
-    saveAuthStore();
+// POST /auth/fee — libera a diaria DEPOIS de um Pix aprovado (v1.8.5).
+// O corpo precisa de {payment_id} (o id do pagamento no Mercado Pago).
+// O servidor confere no Mercado Pago: status "approved", referencia de
+// cobranca de diaria ("diaria-..."), valor igual ao cobrado (ou ao valor
+// atual da diaria, se a cobranca se perdeu no reinicio) — e recusa
+// pagamento ja usado. Sem isto, qualquer conta logada liberava a diaria
+// de graca chamando a rota sem pagar nada (o servidor confiava no app).
+// RENOVACAO ACUMULA (v1.8.5): pagar antes de vencer estende a partir do
+// fim da vigencia atual (max(paidUntil, agora) + feeDays*24h) — antes,
+// pagar com dias restantes nao comprava nenhum dia extra. Reenvio do
+// mesmo pagamento e idempotente: devolve o prazo atual sem estender de
+// novo (o app reenvia quando a primeira tentativa se perdeu).
+app.post("/auth/fee", requireAuth, async (req, res) => {
+  const body = req.body || {};
+  const paymentId =
+    typeof body.payment_id === "string" && body.payment_id.trim()
+      ? body.payment_id.trim()
+      : typeof body.paymentId === "string" && body.paymentId.trim()
+        ? body.paymentId.trim()
+        : "";
+  if (!paymentId) {
+    return res.status(400).json({
+      error: "missing_payment_id",
+      message: "payment_id is required to grant the daily fee."
+    });
   }
+  if (!authStore.usedFeePayments) authStore.usedFeePayments = {};
+  if (authStore.usedFeePayments[paymentId]) {
+    // Pagamento ja usado (reenvio do app): nao estende de novo.
+    return res.json({ ok: true, alreadyUsed: true, account: accountPublic(req.account) });
+  }
+  if (!mpToken()) return tokenNotConfigured(res);
+  let pay;
+  try {
+    const result = await mpRequest("/" + encodeURIComponent(paymentId), { method: "GET" });
+    if (!result.ok) {
+      return res.status(502).json({
+        error: "mercadopago_error",
+        status: result.status,
+        detail: mpErrorDetail(result).slice(0, 500)
+      });
+    }
+    pay = result.data || {};
+  } catch (err) {
+    const msg =
+      err && err.name === "AbortError"
+        ? "Mercado Pago request timed out."
+        : "Could not reach Mercado Pago.";
+    return res.status(502).json({ error: "mercadopago_unreachable", message: msg });
+  }
+  if (pay.status !== "approved") {
+    return res.status(402).json({
+      error: "payment_not_approved",
+      message: "the payment is not approved.",
+      status: pay.status || null
+    });
+  }
+  const ref = String(pay.external_reference || "");
+  if (ref.indexOf("diaria-") !== 0) {
+    return res.status(402).json({
+      error: "payment_reference_mismatch",
+      message: "the payment is not a daily fee charge."
+    });
+  }
+  const amount = Number(pay.transaction_amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(402).json({
+      error: "payment_amount_mismatch",
+      message: "the payment amount is invalid."
+    });
+  }
+  // Valor esperado: o da cobranca registrada (e a cobranca tinha que ser
+  // do valor da diaria na hora); sem registro (reinicio), o valor atual.
+  const charge = pixCharges.get(ref);
+  let expected = appSettings.fee;
+  if (charge && typeof charge.amount === "number") {
+    if (typeof charge.fee === "number" && Math.abs(charge.amount - charge.fee) > 0.01) {
+      return res.status(402).json({
+        error: "payment_amount_mismatch",
+        message: "the charge was not created for the daily fee amount."
+      });
+    }
+    expected = charge.amount;
+  }
+  if (Math.abs(amount - expected) > 0.01) {
+    return res.status(402).json({
+      error: "payment_amount_mismatch",
+      message: "the payment amount does not match the daily fee charge."
+    });
+  }
+  authStore.usedFeePayments[paymentId] = { accountId: req.account.id, usedAt: Date.now() };
+  const base = Math.max(req.account.paidUntil || 0, Date.now());
+  req.account.paidUntil = base + appSettings.feeDays * 24 * 3600 * 1000;
+  saveAuthStore();
   return res.json({ ok: true, account: accountPublic(req.account) });
 });
 
@@ -1640,7 +1846,14 @@ app.post("/auth/reset-password", requireAuth, requireAdmin, (req, res) => {
   target.passHash = newPasswordHash(newPassword);
   revokeTokens(target.id);
   saveAuthStore();
-  return res.json({ ok: true, account: accountPublic(target) });
+  let newToken = null;
+  if (target.id === req.account.id) {
+    // A dona redefiniu a PROPRIA senha: emite um token novo para ela nao
+    // cair em ate 3 min (o validateSessionTick daria 401 com o token
+    // revogado). O app guarda o token novo quando a resposta o traz.
+    newToken = issueToken(target.id);
+  }
+  return res.json({ ok: true, account: accountPublic(target), token: newToken });
 });
 
 // DELETE /auth/users/:id — o admin apaga uma conta. Nao apaga a
@@ -1658,6 +1871,17 @@ app.delete("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
   if (target.isAdmin) {
     return res.status(403).json({ error: "cannot_delete_admin", message: "an admin account cannot be deleted." });
   }
+  // Apagar a conta cancela os chamados dela (como quem chamou e como
+  // mototaxi que aceitou): sem isto, os chamados seguiam apitando para
+  // os mototaxis ate o TTL (60 min pendente).
+  calls.forEach((c) => {
+    if (c.callerPhone === target.id || c.acceptedBy === target.id) {
+      if (c.status === "pending" || c.status === "accepted") {
+        c.status = "cancelled";
+        c.updatedAt = Date.now();
+      }
+    }
+  });
   authStore.accounts = authStore.accounts.filter((a) => a.id !== target.id);
   revokeTokens(target.id);
   saveAuthStore();
@@ -1665,6 +1889,7 @@ app.delete("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
 });
 
 loadAuthStore();
+loadAppSettings();
 
 app.listen(PORT, () => {
   console.log("moto-taxi-backend listening on port " + PORT);
