@@ -86,6 +86,10 @@
  * Um mototaxi so aceita UM chamado: quem ja tem um chamado aceito
  * ativo recebe 409 driver_already_has_call ao tentar aceitar outro
  * (os N chamados vao para N mototaxis diferentes).
+ * REMOVIDO na v1.8.7 (decisao dela 09/11): o multi-moto acabou —
+ * cada conta so chama UMA moto por vez. Os campos de grupo passam
+ * a ser ignorados (todo chamado e avulso) e POST /calls rejeita
+ * com 409 already_has_active_call quem ja tem um chamado ativo.
  * Chat so audio (decisao dela): POST /calls/:id/messages aceita
  * audio gravado (data URL audio/* em base64, max 200000 caracteres,
  * ate 60 s) e foto; o texto nao e mais enviado pelo app (o TTS do
@@ -106,6 +110,35 @@
  * data:audio/webm;codecs=opus;base64,... e o regex anterior
  * rejeitava com 400 invalid_audio: o audio "enviado" nunca era
  * salvo. Nenhuma outra mudanca de comportamento.
+ *
+ * v1.8.7: multi-moto REMOVIDO (decisao dela 09/11): cada conta so
+ * pode chamar UMA moto por vez. POST /calls rejeita com 409
+ * already_has_active_call quem ja tem um chamado ATIVO (pendente
+ * ou aceito — a mesma definicao do GET /calls?callerPhone);
+ * concluido/cancelado/expirado nao bloqueia. Os campos groupId,
+ * groupIndex e groupTotal passam a ser IGNORADOS no corpo do
+ * POST /calls: todo chamado nasce avulso (groupId null,
+ * groupIndex 1, groupTotal 1) e a validacao invalid_group some —
+ * um cliente antigo que mandar groupTotal > 1 cria UM chamado so,
+ * nunca um grupo. Os tres campos continuam em callPublic() com
+ * os valores avulsos, para o app antigo nao quebrar ao ler.
+ * O resto nao muda: aceite de um toque, um chamado por mototaxi
+ * (409 driver_already_has_call), cancelamento (mototaxi volta
+ * para espera, cliente cancela de vez), chat de audio, diaria
+ * e Pix continuam iguais.
+ *
+ * v1.8.8: dias da diaria POR CONTA + editar conta (pedidos dela
+ * 09/11): cada conta pode ter o proprio feeDays (inteiro >= 1,
+ * guardado em accounts.json; null/ausente = usar a configuracao
+ * geral em /settings). POST /auth/fee calcula o paidUntil com o
+ * feeDays DA CONTA quando definido, senao o geral — mudar o
+ * feeDays nao altera um paidUntil ja pago, vale para o proximo
+ * pagamento. Novo PATCH /auth/users/:id (so admin) edita name,
+ * phone e feeDays da conta (feeDays null volta ao geral); so
+ * mexe nesses tres campos — nunca em isAdmin nem feeExempt.
+ * GET /auth/users (e toda resposta com a conta) passa a incluir
+ * feeDays (null quando nao definido). MP_API_BASE (env, so para
+ * teste local) permite apontar o Mercado Pago para um mock.
  */
 
 const express = require("express");
@@ -115,7 +148,13 @@ const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MP_API = "https://api.mercadopago.com/v1/payments";
+const MP_API =
+  (process.env.MP_API_BASE || "").trim() ||
+  "https://api.mercadopago.com/v1/payments";
+// MP_API_BASE (env, SO para teste local): aponta a API do Mercado Pago
+// para outro endereco — o test-local.js usa um mock local para testar
+// o POST /auth/fee sem chamar o Mercado Pago de verdade. Sem ela, o
+// padrao acima vale e nada muda em producao.
 const ALLOWED_ORIGIN =
   process.env.ALLOWED_ORIGIN || "https://moto-taxi-timbauba.onrender.com";
 
@@ -205,7 +244,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.6" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.8" });
 });
 
 app.post("/create-pix", requireAuth, async (req, res) => {
@@ -576,6 +615,10 @@ const presence = new Map();
 // id -> { id, callerName, callerPhone, targetKey, targetName, type, pickup,
 //         destination, amount, groupId, groupIndex, groupTotal, status, phase,
 //         acceptedBy, acceptedName, createdAt, updatedAt, completedAt }
+// groupId/groupIndex/groupTotal existem so por compatibilidade com o app
+// antigo: desde a v1.8.7 todo chamado nasce avulso (null/1/1) — o
+// multi-moto foi removido e os campos do corpo do POST /calls sao
+// ignorados.
 const calls = new Map();
 let callSeq = 0;
 
@@ -624,23 +667,6 @@ function callPublic(c) {
     updatedAt: c.updatedAt,
     completedAt: c.completedAt
   };
-}
-
-// Campo de grupo (v1.8.0): devolve undefined quando ausente (null
-// tambem conta como ausente), o inteiro quando veio um valor inteiro
-// (numero, ou string numerica inteira como "3") e null quando veio
-// um valor invalido (fracao, texto nao-numerico, booleano...). O
-// chamador responde 400 invalid_group e nao cria nada.
-function parseGroupInt(v) {
-  if (v === undefined || v === null) return undefined;
-  if (typeof v === "number") {
-    return Number.isInteger(v) ? v : null;
-  }
-  if (typeof v === "string" && v.trim() !== "") {
-    const n = Number(v.trim());
-    return Number.isInteger(n) ? n : null;
-  }
-  return null;
 }
 
 function pruneStores() {
@@ -746,15 +772,20 @@ app.get("/presence", (req, res) => {
 
 // POST /calls — cria um chamado. Corpo: { callerName, callerPhone,
 // targetKey (null = para qualquer moto), targetName, type
-// ("corrida"|"entrega"), pickup, destination, amount, groupId?,
-// groupIndex?, groupTotal? } — groupId (string, max 128 caracteres),
-// groupIndex e groupTotal (inteiro 1 a 5) marcam o chamado como parte
-// de um grupo (v1.8.0, so para passageiro: N motos = N chamados com
-// o mesmo groupId, groupIndex 1..N e groupTotal N). Sem os campos,
-// o chamado e avulso: groupId null, groupIndex 1, groupTotal 1.
-// groupTotal ou groupIndex invalido responde 400 invalid_group e
-// nao cria nada.
+// ("corrida"|"entrega"), pickup, destination, amount }.
+// Uma conta, UM chamado ativo por vez (v1.8.7): quem ja tem um
+// chamado pendente ou aceito recebe 409 already_has_active_call —
+// a mesma definicao de "ativo" do GET /calls?callerPhone. Concluido,
+// cancelado ou expirado nao bloqueia: depois de terminar o primeiro,
+// um novo chamado e aceito. Isto impede um cliente antigo de criar
+// varios chamados (ou grupos) mandando varios POST /calls.
+// Os campos groupId, groupIndex e groupTotal (v1.8.0, multi-moto)
+// sao IGNORADOS desde a v1.8.7: todo chamado nasce avulso
+// (groupId null, groupIndex 1, groupTotal 1) e nao existe mais
+// validacao invalid_group — um cliente antigo que mandar
+// groupTotal > 1 cria UM chamado so, nunca um grupo.
 app.post("/calls", (req, res) => {
+  pruneStores();
   const body = req.body || {};
   const type = cleanStr(body.type, 20);
   if (type !== "corrida" && type !== "entrega") {
@@ -778,27 +809,23 @@ app.post("/calls", (req, res) => {
       message: "amount must be a number >= 0."
     });
   }
-  // Chamado em grupo (v1.8.0): groupTotal tem que ser inteiro de 1 a
-  // 5; groupIndex tem que ser inteiro de 1 ate groupTotal (quando
-  // groupTotal nao veio, vale 1 — entao groupIndex 2 avulso e
-  // invalido). Qualquer valor invalido: 400 e nada e criado.
-  const groupTotalRaw = parseGroupInt(body.groupTotal);
-  if (groupTotalRaw === null || (groupTotalRaw !== undefined && (groupTotalRaw < 1 || groupTotalRaw > 5))) {
-    return res.status(400).json({
-      error: "invalid_group",
-      message: "groupTotal must be an integer from 1 to 5."
-    });
+  const callerPhone = cleanStr(body.callerPhone, 32);
+  // Uma conta, um chamado ativo por vez: procura um chamado pendente
+  // ou aceito do MESMO chamador (mesma chave que o codigo ja usa —
+  // callerPhone, igual a logica de callParty). Chamado concluido ou
+  // cancelado nao bloqueia. Sem callerPhone nao da para identificar
+  // quem chama, entao nao ha o que checar (o app sempre manda).
+  if (callerPhone) {
+    for (const other of calls.values()) {
+      if (other.status !== "pending" && other.status !== "accepted") continue;
+      if (!sameCaller(other.callerPhone, callerPhone)) continue;
+      return res.status(409).json({
+        error: "already_has_active_call",
+        message: "voce ja tem um chamado ativo.",
+        call: callPublic(other)
+      });
+    }
   }
-  const groupTotal = groupTotalRaw === undefined ? 1 : groupTotalRaw;
-  const groupIndexRaw = parseGroupInt(body.groupIndex);
-  if (groupIndexRaw === null || (groupIndexRaw !== undefined && (groupIndexRaw < 1 || groupIndexRaw > groupTotal))) {
-    return res.status(400).json({
-      error: "invalid_group",
-      message: "groupIndex must be an integer from 1 to groupTotal."
-    });
-  }
-  const groupIndex = groupIndexRaw === undefined ? 1 : groupIndexRaw;
-  const groupId = cleanStr(body.groupId, 128) || null;
   const id =
     "call_" +
     Date.now().toString(36) +
@@ -809,16 +836,18 @@ app.post("/calls", (req, res) => {
   const call = {
     id,
     callerName: cleanStr(body.callerName, 80),
-    callerPhone: cleanStr(body.callerPhone, 32),
+    callerPhone,
     targetKey: cleanStr(body.targetKey, 128) || null,
     targetName: cleanStr(body.targetName, 80) || null,
     type,
     pickup,
     destination,
     amount,
-    groupId,
-    groupIndex,
-    groupTotal,
+    // Grupo neutralizado (v1.8.7): os campos do corpo sao ignorados —
+    // todo chamado e avulso, sempre.
+    groupId: null,
+    groupIndex: 1,
+    groupTotal: 1,
     status: "pending",
     phase: "aguardando",
     acceptedBy: null,
@@ -928,9 +957,9 @@ app.post("/calls/:id/accept", (req, res) => {
       message: "daily fee is required to accept calls."
     });
   }
-  // Um mototaxi so aceita UM chamado (v1.8.0): quem ja tem um chamado
-  // aceito ativo nao pode aceitar outro — os N chamados de um pedido
-  // vao para N mototaxis diferentes. Erro distinto do call_not_pending
+  // Um mototaxi so aceita UM chamado (v1.8.0, mantido na v1.8.7):
+  // quem ja tem um chamado aceito ativo nao pode aceitar outro.
+  // Erro distinto do call_not_pending
   // (caso 1: o chamado ja foi aceito por outro): aqui e o caso 2, o
   // mototaxi ja tem um chamado ("voce ja aceitou um chamado"). A
   // checagem fica no mesmo handler, antes de marcar o aceite (atomica).
@@ -1170,6 +1199,22 @@ function callParty(call, side, key) {
     return normalizePhone(call.callerPhone) === acc.phone;
   }
   return false;
+}
+
+// Mesmo chamador? Usado pelo POST /calls (v1.8.7) para a regra de
+// uma conta, um chamado ativo por vez. Compara a mesma chave que o
+// codigo ja usa (callerPhone): id de conta ("acc_...") por igualdade
+// direta, ou telefone pelos digitos (mesma comparacao do GET
+// /calls?callerPhone). A comparacao por digitos so vale quando
+// nenhum dos dois e id de conta — o id tem digitos ("k1") que
+// casariam por engano com um telefone.
+function sameCaller(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.indexOf("acc_") === 0 || b.indexOf("acc_") === 0) return false;
+  const pa = normalizePhone(a);
+  const pb = normalizePhone(b);
+  return !!pa && pa === pb;
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1521,24 @@ function isFeeValid(account) {
   return (account.paidUntil || 0) > Date.now();
 }
 
+// Dias de validade da diaria DESTA conta (v1.8.8): a conta pode ter
+// o proprio feeDays (definido pela dona na Administracao, via
+// PATCH /auth/users/:id); sem ele (null/ausente/invalido), vale a
+// configuracao geral (feeDays em /settings). Mudar o feeDays de
+// uma conta NAO altera um paidUntil ja pago — vale para o PROXIMO
+// pagamento, que o POST /auth/fee calcula com este valor.
+function feeDaysForAccount(account) {
+  if (
+    account &&
+    typeof account.feeDays === "number" &&
+    Number.isInteger(account.feeDays) &&
+    account.feeDays >= 1
+  ) {
+    return account.feeDays;
+  }
+  return appSettings.feeDays;
+}
+
 function accountPublic(a) {
   return {
     id: a.id,
@@ -1489,6 +1552,16 @@ function accountPublic(a) {
     paidUntil: a.paidUntil || 0,
     isAdmin: !!a.isAdmin,
     feeExempt: !!a.feeExempt,
+    // Dias da diaria desta conta (v1.8.8): null = usar a configuracao
+    // geral (feeDays em /settings). Incluido em toda resposta com a
+    // conta (GET /auth/users, /auth/me, register, login...), para a
+    // Administracao mostrar e editar o valor por conta.
+    feeDays:
+      typeof a.feeDays === "number" &&
+      Number.isInteger(a.feeDays) &&
+      a.feeDays >= 1
+        ? a.feeDays
+        : null,
     feeValid: isFeeValid(a),
     createdAt: a.createdAt
   };
@@ -1720,7 +1793,8 @@ app.post("/auth/change-password", requireAuth, (req, res) => {
 
 // POST /auth/fee — registra a diaria paga na conta (para valer em
 // qualquer aparelho). O paidUntil e calculado NO SERVIDOR: agora +
-// feeDays * 24h (v1.7.0 — antes o app mandava paidUntil de 24h fixo
+// feeDays * 24h (v1.7.0 — antes o app mandava paidUntil de 24h fixo;
+// v1.8.8 — feeDays e o DA CONTA quando definido, senao o geral).
 // POST /auth/fee — libera a diaria DEPOIS de um Pix aprovado (v1.8.5).
 // O corpo precisa de {payment_id} (o id do pagamento no Mercado Pago).
 // O servidor confere no Mercado Pago: status "approved", referencia de
@@ -1813,17 +1887,81 @@ app.post("/auth/fee", requireAuth, async (req, res) => {
   }
   authStore.usedFeePayments[paymentId] = { accountId: req.account.id, usedAt: Date.now() };
   const base = Math.max(req.account.paidUntil || 0, Date.now());
-  req.account.paidUntil = base + appSettings.feeDays * 24 * 3600 * 1000;
+  // Dias da diaria DESTA conta (v1.8.8): feeDays da conta quando
+  // definido, senao a configuracao geral. Conta com feeDays=30 paga
+  // 30 dias (720h); conta sem feeDays usa o geral. Mudar o feeDays
+  // nao altera um paidUntil ja pago — so o proximo pagamento usa o
+  // valor novo (a renovacao acumula a partir do fim da vigencia).
+  req.account.paidUntil = base + feeDaysForAccount(req.account) * 24 * 3600 * 1000;
   saveAuthStore();
   return res.json({ ok: true, account: accountPublic(req.account) });
 });
 
 // GET /auth/users — admin lista as contas (para buscar pelo nome,
-// redefinir senha e apagar conta). Nunca devolve o hash.
+// redefinir senha e apagar conta). Nunca devolve o hash. Cada conta
+// traz feeDays (v1.8.8): null quando a conta usa a configuracao
+// geral, ou o numero de dias proprio dela.
 app.get("/auth/users", requireAuth, requireAdmin, (req, res) => {
   const users = authStore.accounts.map(accountPublic);
   users.sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
   return res.json({ ok: true, users, count: users.length });
+});
+
+// PATCH /auth/users/:id — o admin EDITA uma conta (v1.8.8, pedidos
+// dela 09/11 10:42 e 10:43). Corpo: { name?, phone?, feeDays? } —
+// todos opcionais; feeDays pode ser inteiro >= 1 (dias da diaria
+// SO desta conta) ou null (volta a usar a configuracao geral).
+// Valida TUDO antes de alterar qualquer coisa: valor invalido
+// responde 400 e nao altera nada. So mexe nestes tres campos —
+// nunca em isAdmin, feeExempt, senha ou paidUntil: nem a propria
+// conta do admin pode perder o admin ou a isencao por aqui.
+// Mudar o feeDays nao altera um paidUntil ja pago (vale para o
+// proximo pagamento). Conta inexistente: 404.
+app.patch("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
+  const target = findAccountById(String(req.params.id || ""));
+  if (!target) {
+    return res.status(404).json({ error: "account_not_found", message: "account not found." });
+  }
+  const body = req.body || {};
+  let newName;
+  let newPhone;
+  let newFeeDays;
+  if (body.name !== undefined) {
+    newName = cleanStr(body.name, 80);
+    if (!newName) {
+      return res.status(400).json({ error: "invalid_name", message: "name must not be empty." });
+    }
+  }
+  if (body.phone !== undefined) {
+    newPhone = normalizePhone(body.phone);
+    if (!newPhone) {
+      return res.status(400).json({ error: "invalid_phone", message: "phone must not be empty." });
+    }
+  }
+  if (body.feeDays !== undefined) {
+    if (body.feeDays === null) {
+      newFeeDays = null;
+    } else if (
+      typeof body.feeDays === "number" &&
+      Number.isInteger(body.feeDays) &&
+      body.feeDays >= 1
+    ) {
+      newFeeDays = body.feeDays;
+    } else {
+      return res.status(400).json({
+        error: "invalid_feeDays",
+        message: "feeDays must be a positive integer or null."
+      });
+    }
+  }
+  if (newName !== undefined) target.name = newName;
+  if (newPhone !== undefined) target.phone = newPhone;
+  if (newFeeDays !== undefined) {
+    if (newFeeDays === null) delete target.feeDays;
+    else target.feeDays = newFeeDays;
+  }
+  saveAuthStore();
+  return res.json({ ok: true, account: accountPublic(target) });
 });
 
 // POST /auth/reset-password — o admin redefine a senha de um usuario.

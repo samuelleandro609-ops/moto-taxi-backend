@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * test-local.js — testes locais do moto-taxi-backend (v1.8.6).
+ * test-local.js — testes locais do moto-taxi-backend (v1.8.8).
  *
  * Sobe o server.js numa porta de teste (PORT=3101) e testa por HTTP.
  * NAO chama nenhum endpoint /auth/* — os testes nunca tocam no
@@ -16,17 +16,25 @@ const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const http = require("http");
 
 const PORT = 3101;
 const BASE = "http://127.0.0.1:" + PORT;
 // Arquivo de ajustes do servidor de teste (SETTINGS_FILE): fica no /tmp,
 // nunca no diretorio do repo — o teste apaga no fim.
-const SETTINGS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-1.8.5.json");
+const SETTINGS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-1.8.8.json");
 // Arquivo de contas do servidor de teste (ACCOUNTS_FILE): idem — o
 // teste cria uma conta admin temporaria e apaga no fim.
-const ACCOUNTS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-1.8.5.json");
+const ACCOUNTS_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-1.8.8.json");
 const PORT2 = 3102;
 const BASE2 = "http://127.0.0.1:" + PORT2;
+// (s) diaria por conta: arquivos proprios do servidor de teste do
+// /auth/fee (terceira instancia) e porta do mock do Mercado Pago.
+const SETTINGS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-settings-fee-1.8.8.json");
+const ACCOUNTS_FEE_TEST_FILE = path.join(os.tmpdir(), "mtt-test-accounts-fee-1.8.8.json");
+const PORT3 = 3104;
+const BASE3 = "http://127.0.0.1:" + PORT3;
+const MOCK_MP_PORT = 3103;
 
 let passed = 0;
 let failed = 0;
@@ -63,7 +71,11 @@ async function req(method, p, body) {
 }
 
 async function reqAuth(token, method, p, body) {
-  const resp = await fetch(BASE + p, {
+  return reqAuthBase(BASE, token, method, p, body);
+}
+
+async function reqAuthBase(base, token, method, p, body) {
+  const resp = await fetch(base + p, {
     method,
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
     body: body === undefined ? undefined : JSON.stringify(body)
@@ -150,7 +162,7 @@ async function run() {
     // (g) regressao: versao e settings
     console.log("== regressao: versao e settings ==");
     const root = await req("GET", "/");
-    check("GET / retorna version 1.8.6", root.status === 200 && root.data && root.data.version === "1.8.6", JSON.stringify(root.data));
+    check("GET / retorna version 1.8.8", root.status === 200 && root.data && root.data.version === "1.8.8", JSON.stringify(root.data));
     const settings = await req("GET", "/settings");
     check("GET /settings traz feeDays 1", settings.status === 200 && settings.data && settings.data.feeDays === 1, JSON.stringify(settings.data));
 
@@ -167,83 +179,107 @@ async function run() {
     );
     const plainId = plain.data && plain.data.call && plain.data.call.id;
 
-    // (b) criar com grupo -> campos guardados e devolvidos
-    console.log("== (b) chamado com grupo ==");
+    // (b) multi-moto REMOVIDO (v1.8.7): POST com campos de grupo cria
+    // UM chamado avulso — groupId/groupIndex/groupTotal sao ignorados.
+    // Chamador diferente do de (a): (a) deixou um chamado pendente e
+    // a mesma conta nao pode ter dois ativos.
+    console.log("== (b) campos de grupo ignorados: UM chamado avulso ==");
+    const countB0 = (await req("GET", "/calls?status=all")).data.count;
     const grouped = await req(
       "POST",
       "/calls",
-      baseCall({ groupId: "grp-teste-1", groupIndex: 2, groupTotal: 3 })
+      baseCall({ callerPhone: "81999990010", groupId: "grp-teste-1", groupIndex: 2, groupTotal: 3 })
     );
     check(
-      "criar com grupo devolve 201 com os campos guardados",
+      "criar com campos de grupo devolve 201 com groupId null, groupIndex 1, groupTotal 1 (avulso)",
       grouped.status === 201 &&
-        grouped.data.call.groupId === "grp-teste-1" &&
-        grouped.data.call.groupIndex === 2 &&
-        grouped.data.call.groupTotal === 3,
+        grouped.data.call.groupId === null &&
+        grouped.data.call.groupIndex === 1 &&
+        grouped.data.call.groupTotal === 1,
       JSON.stringify(grouped.data)
     );
     const groupedId = grouped.data && grouped.data.call && grouped.data.call.id;
     const byId = await req("GET", "/calls/" + groupedId);
     check(
-      "GET /calls/:id devolve os campos do grupo",
+      "GET /calls/:id devolve o chamado avulso (sem grupo)",
       byId.status === 200 &&
-        byId.data.call.groupId === "grp-teste-1" &&
-        byId.data.call.groupIndex === 2 &&
-        byId.data.call.groupTotal === 3,
+        byId.data.call.groupId === null &&
+        byId.data.call.groupIndex === 1 &&
+        byId.data.call.groupTotal === 1,
       JSON.stringify(byId.data)
     );
     const list = await req("GET", "/calls");
     const listed = (list.data.calls || []).find((c) => c.id === groupedId);
     check(
-      "GET /calls lista o chamado com os campos do grupo",
-      !!listed && listed.groupId === "grp-teste-1" && listed.groupIndex === 2 && listed.groupTotal === 3,
+      "GET /calls lista o chamado avulso (sem grupo)",
+      !!listed && listed.groupId === null && listed.groupIndex === 1 && listed.groupTotal === 1,
       JSON.stringify(list.data)
     );
+    const countB1 = (await req("GET", "/calls?status=all")).data.count;
+    check(
+      "POST com campos de grupo cria UM chamado so (count +1)",
+      countB1 === countB0 + 1,
+      "antes=" + countB0 + " depois=" + countB1
+    );
 
-    // (c) groupTotal invalido -> 400 e nada criado
-    console.log("== (c) groupTotal invalido ==");
+    // (c) groupTotal "invalido" (0, 6, 2.5) nao rejeita mais: os
+    // campos sao ignorados e o chamado nasce avulso (201). Cada
+    // tentativa usa um chamador diferente — com o mesmo chamador,
+    // a segunda ja daria 409 already_has_active_call (regra nova),
+    // nao por causa do grupo.
+    console.log("== (c) groupTotal invalido e ignorado (nao 400) ==");
     const before = await req("GET", "/calls?status=all");
     const countBefore = before.data.count;
-    for (const bad of [0, 6, 2.5]) {
-      const r = await req("POST", "/calls", baseCall({ groupTotal: bad }));
+    for (let i = 0; i < [0, 6, 2.5].length; i++) {
+      const bad = [0, 6, 2.5][i];
+      const r = await req("POST", "/calls", baseCall({ callerPhone: "8199999010" + i, groupTotal: bad }));
       check(
-        "groupTotal " + bad + " -> 400 invalid_group",
-        r.status === 400 && r.data && r.data.error === "invalid_group",
+        "groupTotal " + bad + " -> 201 avulso (ignorado, sem invalid_group)",
+        r.status === 201 &&
+          r.data.call.groupId === null &&
+          r.data.call.groupIndex === 1 &&
+          r.data.call.groupTotal === 1,
         "status=" + r.status + " " + JSON.stringify(r.data)
       );
     }
     const after = await req("GET", "/calls?status=all");
     check(
-      "nada criado apos groupTotal invalido (count igual)",
-      after.data.count === countBefore,
+      "tres chamados avulsos criados (count +3)",
+      after.data.count === countBefore + 3,
       "antes=" + countBefore + " depois=" + after.data.count
     );
 
-    // (d) groupIndex invalido -> 400
-    console.log("== (d) groupIndex invalido ==");
-    for (const bad of [
+    // (d) groupIndex "invalido" tambem e ignorado (nao 400): o
+    // chamado nasce avulso do mesmo jeito.
+    console.log("== (d) groupIndex invalido e ignorado (nao 400) ==");
+    const badIdx = [
       { groupIndex: 0, groupTotal: 3 },
       { groupIndex: 4, groupTotal: 3 },
-      { groupIndex: 2 }, // sem groupTotal: total padrao 1, indice 2 invalido
+      { groupIndex: 2 }, // sem groupTotal: antes era invalido (total 1, indice 2)
       { groupIndex: 6, groupTotal: 5 }
-    ]) {
-      const r = await req("POST", "/calls", baseCall(bad));
+    ];
+    for (let i = 0; i < badIdx.length; i++) {
+      const bad = badIdx[i];
+      const r = await req("POST", "/calls", baseCall(Object.assign({ callerPhone: "8199999011" + i }, bad)));
       check(
-        "groupIndex " + JSON.stringify(bad) + " -> 400 invalid_group",
-        r.status === 400 && r.data && r.data.error === "invalid_group",
+        "groupIndex " + JSON.stringify(bad) + " -> 201 avulso (ignorado)",
+        r.status === 201 &&
+          r.data.call.groupId === null &&
+          r.data.call.groupIndex === 1 &&
+          r.data.call.groupTotal === 1,
         "status=" + r.status + " " + JSON.stringify(r.data)
       );
     }
     const after2 = await req("GET", "/calls?status=all");
     check(
-      "nada criado apos groupIndex invalido (count igual)",
-      after2.data.count === countBefore,
+      "quatro chamados avulsos criados (count +4)",
+      after2.data.count === countBefore + 7,
       "antes=" + countBefore + " depois=" + after2.data.count
     );
 
     // (e) corrida de aceite: dois accepts ao mesmo tempo
     console.log("== (e) corrida de aceite ==");
-    const race = await req("POST", "/calls", baseCall({ groupId: "grp-corrida", groupIndex: 1, groupTotal: 2 }));
+    const race = await req("POST", "/calls", baseCall({ callerPhone: "81999990020" }));
     const raceId = race.data.call.id;
     const results = await Promise.all([
       req("POST", "/calls/" + raceId + "/accept", { key: "test-key-1", name: "Moto 1" }),
@@ -263,11 +299,11 @@ async function run() {
       JSON.stringify(err409 && err409.data)
     );
     check(
-      "a resposta do aceite (200) traz os campos do grupo",
+      "a resposta do aceite (200) traz o chamado avulso (sem grupo)",
       !!ok200 &&
-        ok200.data.call.groupId === "grp-corrida" &&
+        ok200.data.call.groupId === null &&
         ok200.data.call.groupIndex === 1 &&
-        ok200.data.call.groupTotal === 2,
+        ok200.data.call.groupTotal === 1,
       JSON.stringify(ok200 && ok200.data)
     );
     // Libera o vencedor da corrida: conclui o chamado para (g) nao
@@ -296,8 +332,11 @@ async function run() {
     );
 
     // (g) regressao: fluxo criar/aceitar/fase/concluir e criar/aceitar/cancelar
+    // Chamadores diferentes dos das secoes anteriores (cada um deixou
+    // um chamado ativo) e diferentes entre si: c2 e criado enquanto
+    // c1 ainda esta aceito — com o mesmo chamador daria 409.
     console.log("== (g) regressao: fluxo completo ==");
-    const c1 = await req("POST", "/calls", baseCall());
+    const c1 = await req("POST", "/calls", baseCall({ callerPhone: "81999990030" }));
     const c1id = c1.data.call.id;
     const a1 = await req("POST", "/calls/" + c1id + "/accept", { key: "test-key-1", name: "Moto 1" });
     check("fluxo: accept devolve 200 accepted", a1.status === 200 && a1.data.call.status === "accepted", JSON.stringify(a1.data));
@@ -310,26 +349,31 @@ async function run() {
     const done = await req("POST", "/calls/" + c1id + "/complete", { key: "test-key-1" });
     check("fluxo: complete devolve 200 completed", done.status === 200 && done.data.call.status === "completed", JSON.stringify(done.data));
 
-    const c2 = await req("POST", "/calls", baseCall({ groupId: "grp-cancel", groupIndex: 1, groupTotal: 2 }));
+    const c2 = await req("POST", "/calls", baseCall({ callerPhone: "81999990031" }));
     const c2id = c2.data.call.id;
     const a2 = await req("POST", "/calls/" + c2id + "/accept", { key: "test-key-1", name: "Moto 1" });
     check("fluxo: segundo accept devolve 200", a2.status === 200, JSON.stringify(a2.data));
     const cx = await req("POST", "/calls/" + c2id + "/cancel", { key: "test-key-1" });
     check(
-      "fluxo: cancel do mototaxi devolve 200 com o chamado em espera",
+      "fluxo: cancel do mototaxi devolve 200 com o chamado em espera e avulso",
       cx.status === 200 &&
         cx.data.call.status === "pending" &&
         cx.data.call.phase === "aguardando" &&
-        cx.data.call.groupId === "grp-cancel" &&
+        cx.data.call.groupId === null &&
         cx.data.returnedToPending === true,
       JSON.stringify(cx.data)
     );
 
     // (h) um mototaxi so aceita UM chamado
+    // Chamadores diferentes por chamado: h1 e h2 sao criados com o
+    // outro ainda ativo — com o mesmo chamador, o segundo POST ja
+    // daria 409 already_has_active_call (regra nova). h3 reusa o
+    // chamador de h1 (h1 ja concluido) e h4 usa um terceiro chamador
+    // (h2 continua pendente depois do cancelamento do mototaxi).
     console.log("== (h) um mototaxi so aceita UM chamado ==");
-    const h1 = await req("POST", "/calls", baseCall({ groupId: "grp-um-so", groupIndex: 1, groupTotal: 2 }));
+    const h1 = await req("POST", "/calls", baseCall({ callerPhone: "81999990040" }));
     const h1id = h1.data.call.id;
-    const h2 = await req("POST", "/calls", baseCall({ groupId: "grp-um-so", groupIndex: 2, groupTotal: 2 }));
+    const h2 = await req("POST", "/calls", baseCall({ callerPhone: "81999990041" }));
     const h2id = h2.data.call.id;
     const ha1 = await req("POST", "/calls/" + h1id + "/accept", { key: "test-key-h1", name: "Moto H1" });
     check("h1 aceita o chamado 1 -> 200", ha1.status === 200 && ha1.data.call.status === "accepted", JSON.stringify(ha1.data));
@@ -343,20 +387,20 @@ async function run() {
     check("h2 aceita o chamado 2 -> 200", hb2.status === 200 && hb2.data.call.status === "accepted", JSON.stringify(hb2.data));
     const hd1 = await req("POST", "/calls/" + h1id + "/complete", { key: "test-key-h1" });
     check("h1 conclui o chamado 1 -> 200", hd1.status === 200 && hd1.data.call.status === "completed", JSON.stringify(hd1.data));
-    const h3 = await req("POST", "/calls", baseCall());
+    const h3 = await req("POST", "/calls", baseCall({ callerPhone: "81999990040" }));
     const h3id = h3.data.call.id;
     const ha3 = await req("POST", "/calls/" + h3id + "/accept", { key: "test-key-h1", name: "Moto H1" });
     check("h1 livre apos concluir aceita outro chamado -> 200", ha3.status === 200, JSON.stringify(ha3.data));
     const hx2 = await req("POST", "/calls/" + h2id + "/cancel", { key: "test-key-h2" });
     check("h2 cancela o chamado 2 -> 200 em espera", hx2.status === 200 && hx2.data.call.status === "pending" && hx2.data.returnedToPending === true, JSON.stringify(hx2.data));
-    const h4 = await req("POST", "/calls", baseCall());
+    const h4 = await req("POST", "/calls", baseCall({ callerPhone: "81999990042" }));
     const h4id = h4.data.call.id;
     const ha4 = await req("POST", "/calls/" + h4id + "/accept", { key: "test-key-h2", name: "Moto H2" });
     check("h2 livre apos cancelar aceita outro chamado -> 200", ha4.status === 200, JSON.stringify(ha4.data));
 
     // (i) chat so audio: audio gravado vai pelo servidor e volta no polling
     console.log("== (i) chat: audio gravado ==");
-    const ac = await req("POST", "/calls", baseCall());
+    const ac = await req("POST", "/calls", baseCall({ callerPhone: "81999990050" }));
     const acid = ac.data.call.id;
     const aa = await req("POST", "/calls/" + acid + "/accept", { key: "test-key-audio", name: "Moto Audio" });
     check("audio: accept do chamado -> 200", aa.status === 200, JSON.stringify(aa.data));
@@ -412,7 +456,7 @@ async function run() {
     // apitando (reaparece em GET /calls) e o cliente continua vendo
     // como esperando; o moto fica livre e outro moto pode aceitar.
     console.log("== (j) mototaxi cancela -> chamado volta para espera ==");
-    const j1 = await req("POST", "/calls", baseCall({ groupId: "grp-volta", groupIndex: 1, groupTotal: 2 }));
+    const j1 = await req("POST", "/calls", baseCall({ callerPhone: "81999990060" }));
     const j1id = j1.data.call.id;
     const ja1 = await req("POST", "/calls/" + j1id + "/accept", { key: "test-key-j1", name: "Moto J1" });
     check("j: moto J1 aceita -> 200", ja1.status === 200 && ja1.data.call.status === "accepted", JSON.stringify(ja1.data));
@@ -433,14 +477,14 @@ async function run() {
       (jlist.data.calls || []).some((c) => c.id === j1id),
       JSON.stringify(jlist.data)
     );
-    const jcaller = await req("GET", "/calls?callerPhone=81999990000");
+    const jcaller = await req("GET", "/calls?callerPhone=81999990060");
     const jseen = (jcaller.data.calls || []).find((c) => c.id === j1id);
     check(
       "j: cliente continua vendo o chamado como esperando",
       !!jseen && jseen.status === "pending",
       JSON.stringify(jcaller.data)
     );
-    const j2 = await req("POST", "/calls", baseCall());
+    const j2 = await req("POST", "/calls", baseCall({ callerPhone: "81999990061" }));
     const j2id = j2.data.call.id;
     const ja2 = await req("POST", "/calls/" + j2id + "/accept", { key: "test-key-j1", name: "Moto J1" });
     check("j: J1 livre apos cancelar aceita outro chamado -> 200", ja2.status === 200 && ja2.data.call.status === "accepted", JSON.stringify(ja2.data));
@@ -523,15 +567,17 @@ async function run() {
       kx2.status === 403 && kx2.data && kx2.data.error === "not_call_party",
       "status=" + kx2.status + " " + JSON.stringify(kx2.data)
     );
-    const k2 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_k1" }));
+    // k2 usa outro id de conta: k1 continua aceito e a mesma conta
+    // nao pode ter dois chamados ativos (regra nova).
+    const k2 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_k2" }));
     const k2id = k2.data.call.id;
-    const kc2 = await req("POST", "/calls/" + k2id + "/cancel", { key: "acc_test_caller_k1" });
+    const kc2 = await req("POST", "/calls/" + k2id + "/cancel", { key: "acc_test_caller_k2" });
     check(
       "k: quem chamou CANCELA o proprio chamado pendente com o id da conta -> 200 cancelled",
       kc2.status === 200 && kc2.data.call.status === "cancelled",
       JSON.stringify(kc2.data)
     );
-    const k3 = await req("POST", "/calls", baseCall({ callerPhone: "81999990000" }));
+    const k3 = await req("POST", "/calls", baseCall({ callerPhone: "81999990070" }));
     const k3id = k3.data.call.id;
     const kx3 = await req("POST", "/calls/" + k3id + "/cancel", { key: "test-key-terceiro" });
     check(
@@ -651,21 +697,25 @@ async function run() {
     check("p: phase chegou de quem chamou -> 200 (as duas pontas podem mudar a fase)", pChegouCaller.status === 200 && pChegouCaller.data.call.phase === "chegou", JSON.stringify(pChegouCaller.data));
     const pColetaCaller = await req("POST", "/calls/" + p1id + "/phase", { key: pCallerKey, phase: "coleta_confirmada" });
     check("p: phase coleta_confirmada de quem chamou -> 200", pColetaCaller.status === 200 && pColetaCaller.data.call.phase === "coleta_confirmada", JSON.stringify(pColetaCaller.data));
-    const p2 = await req("POST", "/calls", baseCall({ callerPhone: pCallerKey }));
-    const p2id = p2.data.call.id;
-    const pCancel = await req("POST", "/calls/" + p2id + "/cancel", { key: pCallerKey });
-    check("p: cancel de quem chamou -> 200 cancelled", pCancel.status === 200 && pCancel.data.call.status === "cancelled", JSON.stringify(pCancel.data));
-    const pPhaseCancelled = await req("POST", "/calls/" + p2id + "/phase", { key: pCallerKey, phase: "chegou" });
-    check("p: phase em chamado cancelado -> 409 call_cancelled", pPhaseCancelled.status === 409 && pPhaseCancelled.data && pPhaseCancelled.data.error === "call_cancelled", JSON.stringify(pPhaseCancelled.data));
     const pNoKeyComplete = await req("POST", "/calls/" + p1id + "/complete", {});
     check("p: complete sem key -> 400 missing_key", pNoKeyComplete.status === 400 && pNoKeyComplete.data && pNoKeyComplete.data.error === "missing_key", JSON.stringify(pNoKeyComplete.data));
     const pEmptyKeyComplete = await req("POST", "/calls/" + p1id + "/complete", { key: "" });
     check("p: complete com key vazia -> 400 missing_key", pEmptyKeyComplete.status === 400 && pEmptyKeyComplete.data && pEmptyKeyComplete.data.error === "missing_key", JSON.stringify(pEmptyKeyComplete.data));
     const pDone = await req("POST", "/calls/" + p1id + "/complete", { key: "test-key-p1" });
     check("p: complete do mototaxi que aceitou -> 200 completed", pDone.status === 200 && pDone.data.call.status === "completed", JSON.stringify(pDone.data));
-    const p3 = await req("POST", "/calls", baseCall());
+    // p2 so pode ser criado depois de p1 concluido: a mesma conta nao
+    // pode ter dois chamados ativos (regra nova da v1.8.7).
+    const p2 = await req("POST", "/calls", baseCall({ callerPhone: pCallerKey }));
+    const p2id = p2.data.call.id;
+    const pCancel = await req("POST", "/calls/" + p2id + "/cancel", { key: pCallerKey });
+    check("p: cancel de quem chamou -> 200 cancelled", pCancel.status === 200 && pCancel.data.call.status === "cancelled", JSON.stringify(pCancel.data));
+    const pPhaseCancelled = await req("POST", "/calls/" + p2id + "/phase", { key: pCallerKey, phase: "chegou" });
+    check("p: phase em chamado cancelado -> 409 call_cancelled", pPhaseCancelled.status === 409 && pPhaseCancelled.data && pPhaseCancelled.data.error === "call_cancelled", JSON.stringify(pPhaseCancelled.data));
+    // p3 usa um chamador novo: o padrao (81999990000) deixou um
+    // chamado pendente la em (a) e daria 409.
+    const p3 = await req("POST", "/calls", baseCall({ callerPhone: "81999990071" }));
     const p3id = p3.data.call.id;
-    const pOwnAccept = await req("POST", "/calls/" + p3id + "/accept", { key: "81999990000", name: "Teste" });
+    const pOwnAccept = await req("POST", "/calls/" + p3id + "/accept", { key: "81999990071", name: "Teste" });
     check("p: autor do chamado nao aceita o proprio chamado -> 403 cannot_accept_own_call", pOwnAccept.status === 403 && pOwnAccept.data && pOwnAccept.data.error === "cannot_accept_own_call", JSON.stringify(pOwnAccept.data));
     const pBusy1 = await req("POST", "/presence", { key: "test-key-busy1", name: "Moto Busy", lat: -7.5, lng: -35.3, online: true, busy: true });
     check("p: presence com busy:true -> 200", pBusy1.status === 200 && pBusy1.data && pBusy1.data.online === true, JSON.stringify(pBusy1.data));
@@ -676,6 +726,301 @@ async function run() {
     const pFreeFound = (pPres.data.drivers || []).find((d) => d.key === "test-key-busy2");
     check("p: GET /presence devolve busy:true para quem esta em servico", !!pBusyFound && pBusyFound.busy === true, JSON.stringify(pBusyFound));
     check("p: GET /presence devolve busy:false para quem nao mandou busy", !!pFreeFound && pFreeFound.busy === false, JSON.stringify(pFreeFound));
+
+    // (q) uma conta, um chamado ativo por vez (v1.8.7): a regra nova
+    // do POST /calls — pendente ou aceito bloqueia um segundo
+    // chamado da MESMA conta; concluido/cancelado libera; outra
+    // conta nao e afetada.
+    console.log("== (q) uma conta, um chamado ativo por vez ==");
+    const q1 = await req("POST", "/calls", baseCall({ callerPhone: "81999990080" }));
+    check("q: primeiro chamado da conta -> 201", q1.status === 201, JSON.stringify(q1.data));
+    const q1id = q1.data.call.id;
+    const q1b = await req("POST", "/calls", baseCall({ callerPhone: "81999990080" }));
+    check(
+      "q: segundo chamado com o primeiro pendente -> 409 already_has_active_call",
+      q1b.status === 409 && q1b.data && q1b.data.error === "already_has_active_call",
+      "status=" + q1b.status + " " + JSON.stringify(q1b.data)
+    );
+    check(
+      "q: o 409 devolve o chamado ativo na resposta",
+      q1b.data && q1b.data.call && q1b.data.call.id === q1id,
+      JSON.stringify(q1b.data)
+    );
+    const qa1 = await req("POST", "/calls/" + q1id + "/accept", { key: "test-key-q1", name: "Moto Q1" });
+    check("q: aceite do primeiro -> 200", qa1.status === 200 && qa1.data.call.status === "accepted", JSON.stringify(qa1.data));
+    const q1c = await req("POST", "/calls", baseCall({ callerPhone: "81999990080" }));
+    check(
+      "q: segundo chamado com o primeiro aceito -> 409 already_has_active_call",
+      q1c.status === 409 && q1c.data && q1c.data.error === "already_has_active_call",
+      "status=" + q1c.status + " " + JSON.stringify(q1c.data)
+    );
+    const qd1 = await req("POST", "/calls/" + q1id + "/complete", { key: "test-key-q1" });
+    check("q: concluir o primeiro -> 200 completed", qd1.status === 200 && qd1.data.call.status === "completed", JSON.stringify(qd1.data));
+    const q2 = await req("POST", "/calls", baseCall({ callerPhone: "81999990080" }));
+    check("q: novo chamado depois de concluir o primeiro -> 201", q2.status === 201, JSON.stringify(q2.data));
+    // Mesmo telefone escrito de outro jeito ((81) 99999-...) e a
+    // mesma conta: tambem bloqueia (comparacao pelos digitos).
+    const q2b = await req("POST", "/calls", baseCall({ callerPhone: "(81) 99999-0080" }));
+    check(
+      "q: mesmo telefone com formatacao diferente -> 409 already_has_active_call",
+      q2b.status === 409 && q2b.data && q2b.data.error === "already_has_active_call",
+      "status=" + q2b.status + " " + JSON.stringify(q2b.data)
+    );
+    // Chamado ativo de OUTRA conta nao bloqueia (cada conta tem o seu).
+    const qOther = await req("POST", "/calls", baseCall({ callerPhone: "81999990081" }));
+    check("q: chamado ativo de outra conta nao bloqueia -> 201", qOther.status === 201, JSON.stringify(qOther.data));
+    const qOtherB = await req("POST", "/calls", baseCall({ callerPhone: "81999990081" }));
+    check(
+      "q: a outra conta tambem nao cria um segundo -> 409 already_has_active_call",
+      qOtherB.status === 409 && qOtherB.data && qOtherB.data.error === "already_has_active_call",
+      "status=" + qOtherB.status + " " + JSON.stringify(qOtherB.data)
+    );
+    // Cancelar libera: conta com id de conta (acc_...) consegue
+    // cancelar o proprio chamado pendente (o telefone sozinho nao
+    // identifica a conta no cancelamento).
+    const q3 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_q3" }));
+    check("q: primeiro chamado da conta acc_ -> 201", q3.status === 201, JSON.stringify(q3.data));
+    const q3id = q3.data.call.id;
+    const q3b = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_q3" }));
+    check(
+      "q: segundo chamado da conta acc_ -> 409 already_has_active_call",
+      q3b.status === 409 && q3b.data && q3b.data.error === "already_has_active_call",
+      "status=" + q3b.status + " " + JSON.stringify(q3b.data)
+    );
+    const q3x = await req("POST", "/calls/" + q3id + "/cancel", { key: "acc_test_caller_q3" });
+    check("q: cliente cancela o proprio chamado -> 200 cancelled", q3x.status === 200 && q3x.data.call.status === "cancelled", JSON.stringify(q3x.data));
+    const q4 = await req("POST", "/calls", baseCall({ callerPhone: "acc_test_caller_q3" }));
+    check("q: novo chamado depois de cancelar o primeiro -> 201", q4.status === 201, JSON.stringify(q4.data));
+
+    // (r) editar conta: PATCH /auth/users/:id (v1.8.8) — so admin,
+    // so name/phone/feeDays, validacao antes de alterar, persiste.
+    console.log("== (r) PATCH /auth/users/:id edita conta ==");
+    const rReg = await req("POST", "/auth/register", { name: "Moto R", phone: "81999990090", password: "teste1234", role: "mototaxi" });
+    check("r: registrar conta para editar -> 201", rReg.status === 201 && rReg.data && rReg.data.account && !!rReg.data.account.id, JSON.stringify(rReg.data));
+    const rId = rReg.data.account.id;
+    check(
+      "r: conta nova nasce com feeDays null (usa o geral)",
+      rReg.data.account.feeDays === null,
+      JSON.stringify(rReg.data.account)
+    );
+    const rNoAuth = await req("PATCH", "/auth/users/" + rId, { name: "Outro" });
+    check("r: PATCH sem token -> 401", rNoAuth.status === 401, JSON.stringify(rNoAuth.data));
+    const rNonAdmin = await reqAuth(userToken, "PATCH", "/auth/users/" + rId, { name: "Outro" });
+    check("r: PATCH com token de nao-admin -> 403", rNonAdmin.status === 403, JSON.stringify(rNonAdmin.data));
+    const rMissing = await reqAuth(adminToken, "PATCH", "/auth/users/acc_que_nao_existe", { name: "Outro" });
+    check("r: PATCH em conta inexistente -> 404", rMissing.status === 404, JSON.stringify(rMissing.data));
+    // Dados invalidos: cada um da 400 e nao altera nada.
+    const rBad = [
+      [{ name: "" }, "name vazio"],
+      [{ name: "   " }, "name so espacos"],
+      [{ phone: "" }, "phone vazio"],
+      [{ feeDays: 0 }, "feeDays 0"],
+      [{ feeDays: -5 }, "feeDays negativo"],
+      [{ feeDays: 1.5 }, "feeDays fracao"],
+      [{ feeDays: "30" }, "feeDays texto"],
+      [{ feeDays: true }, "feeDays booleano"]
+    ];
+    for (const [body, label] of rBad) {
+      const bad = await reqAuth(adminToken, "PATCH", "/auth/users/" + rId, body);
+      check("r: PATCH " + label + " -> 400", bad.status === 400, "status=" + bad.status + " " + JSON.stringify(bad.data));
+    }
+    const rAfterBad = await reqAuth(adminToken, "GET", "/auth/users");
+    const rUnchanged = (rAfterBad.data.users || []).find((u) => u.id === rId);
+    check(
+      "r: depois dos PATCH invalidos a conta segue intacta (nome, telefone, feeDays null)",
+      !!rUnchanged && rUnchanged.name === "Moto R" && rUnchanged.phone === "81999990090" && rUnchanged.feeDays === null,
+      JSON.stringify(rUnchanged)
+    );
+    // PATCH valido: nome + telefone + feeDays de uma vez.
+    const rOk = await reqAuth(adminToken, "PATCH", "/auth/users/" + rId, { name: "Moto Editado", phone: "81999990095", feeDays: 30 });
+    check(
+      "r: PATCH valido -> 200 com nome, telefone e feeDays atualizados",
+      rOk.status === 200 && rOk.data && rOk.data.account && rOk.data.account.name === "Moto Editado" && rOk.data.account.phone === "81999990095" && rOk.data.account.feeDays === 30,
+      JSON.stringify(rOk.data)
+    );
+    const rList = await reqAuth(adminToken, "GET", "/auth/users");
+    const rFound = (rList.data.users || []).find((u) => u.id === rId);
+    check(
+      "r: GET /auth/users mostra a conta editada com feeDays 30",
+      !!rFound && rFound.name === "Moto Editado" && rFound.phone === "81999990095" && rFound.feeDays === 30,
+      JSON.stringify(rFound)
+    );
+    // PATCH so o nome: os outros campos nao mudam.
+    const rNameOnly = await reqAuth(adminToken, "PATCH", "/auth/users/" + rId, { name: "Moto R2" });
+    check(
+      "r: PATCH so com name -> 200, so o nome muda (telefone e feeDays ficam)",
+      rNameOnly.status === 200 && rNameOnly.data.account.name === "Moto R2" && rNameOnly.data.account.phone === "81999990095" && rNameOnly.data.account.feeDays === 30,
+      JSON.stringify(rNameOnly.data)
+    );
+    // PATCH vazio: nada para mudar, devolve a conta como esta.
+    const rEmpty = await reqAuth(adminToken, "PATCH", "/auth/users/" + rId, {});
+    check(
+      "r: PATCH vazio -> 200 com a conta inalterada",
+      rEmpty.status === 200 && rEmpty.data.account.name === "Moto R2" && rEmpty.data.account.feeDays === 30,
+      JSON.stringify(rEmpty.data)
+    );
+    // feeDays null volta a usar o geral.
+    const rNull = await reqAuth(adminToken, "PATCH", "/auth/users/" + rId, { feeDays: null });
+    check(
+      "r: PATCH feeDays null -> 200 com feeDays null (volta ao geral)",
+      rNull.status === 200 && rNull.data.account.feeDays === null && rNull.data.account.name === "Moto R2" && rNull.data.account.phone === "81999990095",
+      JSON.stringify(rNull.data)
+    );
+    // O admin NAO tira o proprio admin nem a propria isencao por aqui:
+    // os campos isAdmin/feeExempt sao ignorados; so o nome muda.
+    const adminId = adminReg.data.account.id;
+    const rSelf = await reqAuth(adminToken, "PATCH", "/auth/users/" + adminId, { name: "Admin Renomeada", isAdmin: false, feeExempt: false });
+    check(
+      "r: PATCH na propria conta do admin com isAdmin/feeExempt falsos -> 200, nome muda mas isAdmin e feeExempt continuam true",
+      rSelf.status === 200 && rSelf.data.account.name === "Admin Renomeada" && rSelf.data.account.isAdmin === true && rSelf.data.account.feeExempt === true,
+      JSON.stringify(rSelf.data)
+    );
+    // Persiste no reinicio: outro processo com o mesmo accounts.json
+    // ve a conta editada (nome, telefone, feeDays null).
+    const child2r = spawn(process.execPath, [path.join(__dirname, "server.js")], {
+      env: Object.assign({}, process.env, { PORT: String(PORT2), SETTINGS_FILE: SETTINGS_TEST_FILE, ACCOUNTS_FILE: ACCOUNTS_TEST_FILE, MP_ACCESS_TOKEN: "" }),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    try {
+      const ready2r = await waitReadyBase(BASE2);
+      check("r: segundo servidor sobe na porta " + PORT2, ready2r === true);
+      const rList2 = await reqAuthBase(BASE2, adminToken, "GET", "/auth/users");
+      const rFound2 = (rList2.data.users || []).find((u) => u.id === rId);
+      check(
+        "r: servidor reiniciado le accounts.json e ve a conta editada (feeDays null)",
+        rList2.status === 200 && !!rFound2 && rFound2.name === "Moto R2" && rFound2.phone === "81999990095" && rFound2.feeDays === null,
+        JSON.stringify(rFound2)
+      );
+    } finally {
+      child2r.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 300));
+      if (!child2r.killed) child2r.kill("SIGKILL");
+    }
+
+    // (s) diaria por conta: POST /auth/fee usa o feeDays da conta
+    // (v1.8.8) — com um mock local do Mercado Pago (MP_API_BASE) e
+    // uma terceira instancia do servidor, para nao tocar no
+    // servidor principal nem no Mercado Pago de verdade.
+    console.log("== (s) POST /auth/fee usa feeDays da conta ==");
+    try {
+      fs.unlinkSync(SETTINGS_FEE_TEST_FILE);
+    } catch (e) {
+      // nao existia: nada a limpar
+    }
+    try {
+      fs.unlinkSync(ACCOUNTS_FEE_TEST_FILE);
+    } catch (e) {
+      // nao existia: nada a limpar
+    }
+    // Mock do Mercado Pago: qualquer GET /v1/payments/<id> devolve
+    // um pagamento APROVADO de R$ 5 com referencia de diaria — o
+    // suficiente para o /auth/fee conferir e liberar.
+    const mockMp = http.createServer((mockReq, mockRes) => {
+      const m = /^\/v1\/payments\/([^/?]+)$/.exec(mockReq.url || "");
+      if (mockReq.method === "GET" && m) {
+        const pid = decodeURIComponent(m[1]);
+        mockRes.writeHead(200, { "Content-Type": "application/json" });
+        mockRes.end(JSON.stringify({
+          id: pid,
+          status: "approved",
+          status_detail: "accredited",
+          transaction_amount: 5,
+          external_reference: "diaria-teste-" + pid
+        }));
+        return;
+      }
+      mockRes.writeHead(404, { "Content-Type": "application/json" });
+      mockRes.end(JSON.stringify({ error: "not_found" }));
+    });
+    await new Promise((resolve) => mockMp.listen(MOCK_MP_PORT, "127.0.0.1", resolve));
+    const child3 = spawn(process.execPath, [path.join(__dirname, "server.js")], {
+      env: Object.assign({}, process.env, {
+        PORT: String(PORT3),
+        SETTINGS_FILE: SETTINGS_FEE_TEST_FILE,
+        ACCOUNTS_FILE: ACCOUNTS_FEE_TEST_FILE,
+        MP_ACCESS_TOKEN: "test-token",
+        MP_API_BASE: "http://127.0.0.1:" + MOCK_MP_PORT + "/v1/payments"
+      }),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    try {
+      const ready3 = await waitReadyBase(BASE3);
+      check("s: terceiro servidor sobe na porta " + PORT3 + " (com mock do Mercado Pago)", ready3 === true);
+      if (ready3) {
+        const sAdminReg = await reqBase(BASE3, "POST", "/auth/register", { name: "Admin Fee", phone: "81999990096", password: "teste1234", role: "mototaxi" });
+        check("s: registrar admin no servidor 3 -> 201", sAdminReg.status === 201 && sAdminReg.data && !!sAdminReg.data.token, JSON.stringify(sAdminReg.data));
+        const sAdminToken = sAdminReg.data && sAdminReg.data.token;
+        const sM1Reg = await reqBase(BASE3, "POST", "/auth/register", { name: "Moto Fee 1", phone: "81999990097", password: "teste1234", role: "mototaxi" });
+        check("s: registrar mototaxi M1 -> 201 com feeDays null", sM1Reg.status === 201 && sM1Reg.data && sM1Reg.data.account && sM1Reg.data.account.feeDays === null, JSON.stringify(sM1Reg.data));
+        const sM1Id = sM1Reg.data.account.id;
+        const sM1Token = sM1Reg.data.token;
+        // Conta com feeDays=30: um pagamento vale 30 dias (720h).
+        const sPatch30 = await reqAuthBase(BASE3, sAdminToken, "PATCH", "/auth/users/" + sM1Id, { feeDays: 30 });
+        check("s: PATCH feeDays 30 na conta M1 -> 200", sPatch30.status === 200 && sPatch30.data.account.feeDays === 30, JSON.stringify(sPatch30.data));
+        const sBefore1 = Date.now();
+        const sFee1 = await reqAuthBase(BASE3, sM1Token, "POST", "/auth/fee", { payment_id: "fee-test-1" });
+        const sAfter1 = Date.now();
+        const sPaid1 = sFee1.data && sFee1.data.account && sFee1.data.account.paidUntil;
+        check(
+          "s: POST /auth/fee com feeDays 30 -> 200 e paidUntil ~ agora + 30 dias",
+          sFee1.status === 200 && typeof sPaid1 === "number" && sPaid1 >= sBefore1 + 30 * 24 * 3600 * 1000 - 5000 && sPaid1 <= sAfter1 + 30 * 24 * 3600 * 1000 + 5000,
+          "status=" + sFee1.status + " paidUntil=" + sPaid1 + " " + JSON.stringify(sFee1.data)
+        );
+        // Mudar o feeDays NAO altera um paidUntil ja pago.
+        const sPatch7 = await reqAuthBase(BASE3, sAdminToken, "PATCH", "/auth/users/" + sM1Id, { feeDays: 7 });
+        check("s: PATCH feeDays 7 na conta M1 -> 200", sPatch7.status === 200 && sPatch7.data.account.feeDays === 7, JSON.stringify(sPatch7.data));
+        const sMe = await reqAuthBase(BASE3, sM1Token, "GET", "/auth/me");
+        check(
+          "s: mudar o feeDays nao altera o paidUntil ja pago",
+          sMe.status === 200 && sMe.data.account.paidUntil === sPaid1,
+          JSON.stringify(sMe.data)
+        );
+        // feeDays null volta ao geral (1 dia): a renovacao acumula a
+        // partir do fim da vigencia atual (+ 1 dia em cima dos 30).
+        const sPatchNull = await reqAuthBase(BASE3, sAdminToken, "PATCH", "/auth/users/" + sM1Id, { feeDays: null });
+        check("s: PATCH feeDays null na conta M1 -> 200", sPatchNull.status === 200 && sPatchNull.data.account.feeDays === null, JSON.stringify(sPatchNull.data));
+        const sFee2 = await reqAuthBase(BASE3, sM1Token, "POST", "/auth/fee", { payment_id: "fee-test-2" });
+        const sPaid2 = sFee2.data && sFee2.data.account && sFee2.data.account.paidUntil;
+        check(
+          "s: POST /auth/fee com feeDays null usa o geral (1 dia): paidUntil ~ anterior + 1 dia",
+          sFee2.status === 200 && typeof sPaid2 === "number" && Math.abs(sPaid2 - (sPaid1 + 24 * 3600 * 1000)) < 120000,
+          "status=" + sFee2.status + " paidUntil=" + sPaid2 + " anterior=" + sPaid1 + " " + JSON.stringify(sFee2.data)
+        );
+        // Conta sem feeDays nunca definido tambem usa o geral (1 dia).
+        const sM2Reg = await reqBase(BASE3, "POST", "/auth/register", { name: "Moto Fee 2", phone: "81999990098", password: "teste1234", role: "mototaxi" });
+        check("s: registrar mototaxi M2 (sem feeDays) -> 201", sM2Reg.status === 201 && sM2Reg.data && !!sM2Reg.data.token, JSON.stringify(sM2Reg.data));
+        const sM2Token = sM2Reg.data.token;
+        const sBefore3 = Date.now();
+        const sFee3 = await reqAuthBase(BASE3, sM2Token, "POST", "/auth/fee", { payment_id: "fee-test-3" });
+        const sAfter3 = Date.now();
+        const sPaid3 = sFee3.data && sFee3.data.account && sFee3.data.account.paidUntil;
+        check(
+          "s: POST /auth/fee de conta sem feeDays usa o geral -> paidUntil ~ agora + 1 dia",
+          sFee3.status === 200 && typeof sPaid3 === "number" && sPaid3 >= sBefore3 + 24 * 3600 * 1000 - 5000 && sPaid3 <= sAfter3 + 24 * 3600 * 1000 + 5000,
+          "status=" + sFee3.status + " paidUntil=" + sPaid3 + " " + JSON.stringify(sFee3.data)
+        );
+      }
+    } finally {
+      child3.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 300));
+      if (!child3.killed) child3.kill("SIGKILL");
+      await new Promise((resolve) => mockMp.close(resolve));
+      try {
+        fs.unlinkSync(SETTINGS_FEE_TEST_FILE);
+      } catch (e) {
+        // ja apagado ou nunca criado
+      }
+      try {
+        fs.unlinkSync(ACCOUNTS_FEE_TEST_FILE);
+      } catch (e) {
+        // ja apagado ou nunca criado
+      }
+      try {
+        fs.unlinkSync(ACCOUNTS_FEE_TEST_FILE + ".tmp");
+      } catch (e) {
+        // ja apagado ou nunca criado
+      }
+    }
   } finally {
     child.kill("SIGTERM");
     await new Promise((r) => setTimeout(r, 300));

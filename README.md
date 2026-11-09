@@ -85,18 +85,21 @@ clicar no moto no mapa). Corpo:
 
 `type` é `"corrida"` ou `"entrega"`. Resposta (201): `{ "ok": true, "call": { "id": "call_...", "status": "pending", "phase": "aguardando", ... } }`.
 
-**Chamados em grupo (v1.8.0, só para passageiro):** para pedir N motos
-(máx. 5) o app cria N chamados, um para cada moto, todos com o mesmo
-`groupId` (string, máx. 128 caracteres), `groupIndex` de 1 a N e
-`groupTotal` N. Ex.: 3 motos → 3 chamados com `groupId: "grp-..."`,
-`groupIndex: 1`, `2` e `3`, `groupTotal: 3`. Cada chamado continua
-independente (um aceita e vai, o outro continua pendente) e o aceite
-continua atômico (o primeiro aceita, o segundo recebe 409). Sem os
-campos, o chamado é avulso: `groupId: null`, `groupIndex: 1`,
-`groupTotal: 1`. `groupTotal` fora de 1 a 5 ou `groupIndex` fora de 1
-até `groupTotal` responde **400** `invalid_group` e **não cria nada**.
-Os três campos voltam em todas as respostas que devolvem um chamado
-(criar, listar, detalhe, aceitar, fase, concluir, cancelar, touch).
+**Uma conta, um chamado ativo por vez (v1.8.7):** quem já tem um
+chamado pendente ou aceito recebe **409** `already_has_active_call`
+(a resposta traz o chamado ativo em `call`). Concluído, cancelado
+ou expirado não bloqueia: depois de terminar o primeiro, um novo
+chamado é aceito. Chamado ativo de outra conta não bloqueia.
+
+**Multi-moto REMOVIDO (v1.8.7):** os campos `groupId`,
+`groupIndex` e `groupTotal` (v1.8.0) são **ignorados** no corpo do
+`POST /calls` — todo chamado nasce avulso: `groupId: null`,
+`groupIndex: 1`, `groupTotal: 1`. Um cliente antigo que mandar
+`groupTotal: 3` cria UM chamado só, nunca um grupo, e não existe
+mais o erro 400 `invalid_group`. Os três campos continuam em
+todas as respostas que devolvem um chamado (criar, listar,
+detalhe, aceitar, fase, concluir, cancelar, touch), sempre com
+os valores avulsos, para o app antigo não quebrar ao ler.
 
 ### GET /calls
 
@@ -287,10 +290,35 @@ nunca diminui. O app chama depois de confirmar o Pix pago; o corpo
 não precisa de nada (um `paidUntil` mandado pelo app é ignorado).
 A conta da dona (`feeExempt`) e o modo gratuito não passam por aqui.
 
+**Dias da diária por conta (v1.8.8):** o `feeDays` usado aqui é o
+**da conta** quando ela tem um definido (via `PATCH
+/auth/users/:id`), senão a configuração geral (`feeDays` em
+`/settings`). Conta com `feeDays: 30` paga 30 dias (720 h); conta
+sem `feeDays` usa o geral. Mudar o `feeDays` de uma conta **não**
+altera um `paidUntil` já pago — só o **próximo** pagamento usa o
+valor novo (a renovação acumula a partir do fim da vigência atual).
+
 ### GET /auth/users
 
 Admin lista as contas (buscar pelo nome, redefinir senha, apagar
-conta). Não-admin: **403** `admin_only`.
+conta). Não-admin: **403** `admin_only`. Cada conta traz `feeDays`
+(v1.8.8): `null` quando a conta usa a configuração geral, ou o
+número de dias próprio dela — é o que a Administração mostra e
+edita por conta.
+
+### PATCH /auth/users/:id
+
+O admin edita uma conta (v1.8.8). Corpo: `{ "name"?, "phone"?,
+"feeDays"? }` — todos opcionais. `feeDays` pode ser inteiro >= 1
+(dias da diária **só desta conta**) ou `null` (volta a usar a
+configuração geral). Valores inválidos (`name`/`phone` vazios,
+`feeDays` 0, negativo, fração ou não-numérico) respondem **400** e
+não alteram nada. Conta inexistente: **404**. Sem token: **401**;
+não-admin: **403**. O endpoint só mexe em `name`, `phone` e
+`feeDays` — nunca em `isAdmin`, `feeExempt`, senha ou `paidUntil`:
+nem a própria conta do admin perde o admin ou a isenção por aqui.
+Resposta: `{ "ok": true, "account": { ... } }` com a conta
+atualizada (sem hash de senha).
 
 ### POST /auth/reset-password
 
@@ -329,6 +357,13 @@ só muda a duração. Valor inválido (0, negativo, fração ou
 não-numérico) responde **400** `invalid_feeDays` e não altera nada.
 Aceita também `fee_days` e `diasDiaria`.
 
+**Dias da diária por conta (v1.8.8):** além do geral, a dona pode
+definir os dias **diretamente numa conta** (`PATCH
+/auth/users/:id`, campo `feeDays`): a conta com `feeDays: 30` paga
+30 dias (720 h) e a conta sem `feeDays` (`null`) usa o geral.
+Mudar o `feeDays` de uma conta não altera um `paidUntil` já pago —
+só o próximo pagamento usa o valor novo.
+
 **Modo gratuito da diária (`freeFee`):** botão/interruptor na
 Administração. Com `freeFee: true`, o mototáxi trabalha **sem
 pagar** a diária (sem Pix, sem trava). Com `freeFee: false` e um
@@ -342,10 +377,24 @@ ninguém consegue ficar online. Aceita também `free_fee`, `free`,
 
 ### GET /
 
-Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.8.2" }`.
+Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version: "1.8.8" }`.
 
 ## Changelog
 
+- **v1.8.8** — dias da diária **por conta** + editar conta: cada
+  conta pode ter o próprio `feeDays` (inteiro >= 1, guardado em
+  `accounts.json`; `null`/ausente = configuração geral). `POST
+  /auth/fee` calcula o `paidUntil` com o `feeDays` da conta quando
+  definido, senão o geral; mudar o `feeDays` não altera um
+  `paidUntil` já pago (vale para o próximo pagamento). Novo `PATCH
+  /auth/users/:id` (só admin) edita `name`, `phone` e `feeDays`
+  (`null` volta ao geral); só mexe nesses três campos, nunca em
+  `isAdmin` nem `feeExempt`. `GET /auth/users` (e toda resposta com
+  a conta) passa a incluir `feeDays` (`null` quando não definido).
+  `already_has_active_call` quem já tem um chamado ativo (pendente
+  ou aceito); concluído/cancelado não bloqueia. `groupId`,
+  `groupIndex` e `groupTotal` passam a ser ignorados (todo chamado
+  nasce avulso) e o 400 `invalid_group` some.
 - **v1.8.2** — áudio do chat aceita parâmetros MIME (`;codecs=opus`):
   o MediaRecorder do Chrome/Android produz
   `data:audio/webm;codecs=opus;base64,...` e o regex anterior
@@ -357,9 +406,9 @@ Saúde do serviço. Responde `{ ok: true, service: "moto-taxi-backend", version:
   `returnedToPending: true`); o cancelamento pelo cliente continua
   cancelando o chamado de vez.
 - **v1.8.0** — chamados em grupo (só passageiro): `POST /calls`
-  aceita `groupId`, `groupIndex` e `groupTotal` (1 a 5); os três
-  campos voltam em todas as respostas de chamado; `groupTotal` ou
-  `groupIndex` inválido responde 400 `invalid_group` sem criar nada.
+  aceitava `groupId`, `groupIndex` e `groupTotal` (1 a 5); `groupTotal`
+  ou `groupIndex` inválido respondia 400 `invalid_group` sem criar
+  nada. **Removido na v1.8.7** — ver acima.
 - **v1.7.0** — dias de validade da diária configuráveis (`feeDays`).
 
 ### POST /create-pix
@@ -430,6 +479,12 @@ MP_ACCESS_TOKEN=SEU_TOKEN npm start
 
 O serviço escuta na porta `PORT` (ou 3000). Sem `MP_ACCESS_TOKEN`,
 sobe normalmente, mas `/create-pix` responde 503.
+
+Testes locais: `node test-local.js` (sobe o servidor em portas de
+teste e testa por HTTP; nunca toca no `accounts.json` real nem no
+Mercado Pago de verdade — o `POST /auth/fee` é testado com um mock
+local, apontado pela variável `MP_API_BASE`, usada só nos testes;
+sem ela, o endereço do Mercado Pago é o oficial).
 
 ## Deploy no Render
 
