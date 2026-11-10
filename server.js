@@ -147,6 +147,28 @@
  * com o produto e tem que entregar ate o fim. A caminho da coleta o
  * cancelamento continua como antes (volta para espera) e a corrida
  * (passageiro) nao muda, nem o cancelamento pelo cliente.
+ *
+ * v1.8.11: VERIFICACAO DE QUEM PODE TRABALHAR DE GRACA (decisao dela
+ * 10/11): com o modo gratuito ligado, trabalhar de graca exige a conta
+ * LIBERADA pela dona (freeAuthorized: true na conta, persistido em
+ * accounts.json). A dona gera um CODIGO de 6 digitos para a conta
+ * (POST /auth/free-code/generate, so admin; uso unico, vale 30 min;
+ * gerar outro invalida o anterior) e manda no WhatsApp dela mesma; o
+ * mototaxi digita o codigo no app (POST /auth/free-code/verify) e a
+ * conta fica liberada — o codigo so vale para a conta para a qual foi
+ * gerado. A liberacao persiste na conta: desligou o gratuito, ninguem
+ * trabalha de graca (nem quem ja digitou o codigo) e tem que pagar a
+ * diaria; ligou de novo, quem ja foi liberado trabalha de graca sem
+ * digitar nada. A dona REVOGA a liberacao com PATCH /auth/users/:id
+ * {freeAuthorized:false} (e pode liberar direto com true). A diaria
+ * PAGA continua valendo como antes (quem pagou trabalha sem codigo)
+ * e a conta isenta (a dona) tambem. O servidor passa a conferir em
+ * POST /presence e POST /calls/:id/accept: conta conhecida sem
+ * diaria valida e sem liberacao no modo gratuito recebe 402
+ * free_authorization_required (erro distinto de fee_required, que
+ * continua para a diaria vencida com o gratuito desligado).
+ * GET /auth/users (e toda resposta com a conta) passa a incluir
+ * freeAuthorized. Os codigos vivem em free-codes.json (persistido).
  */
 
 const express = require("express");
@@ -252,7 +274,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.10" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.11" });
 });
 
 app.post("/create-pix", requireAuth, async (req, res) => {
@@ -684,6 +706,54 @@ function prunePixCharges() {
   if (removed) savePixCharges();
 }
 
+// CODIGOS DE LIBERACAO PARA TRABALHAR DE GRACA (v1.8.11): a dona gera
+// um codigo de 6 digitos para UMA conta (POST /auth/free-code/generate)
+// e manda no WhatsApp dela mesma; o mototaxi digita no app (POST
+// /auth/free-code/verify). Uso unico, vale 30 min; gerar outro para
+// a mesma conta invalida o anterior. Persistido em free-codes.json
+// para sobreviver ao reinicio (igual ao pix-charges.json).
+const FREE_CODES_FILE =
+  process.env.FREE_CODES_FILE || path.join(__dirname, "free-codes.json");
+const FREE_CODE_TTL_MS = 30 * 60 * 1000; // codigo vale 30 minutos
+let freeCodes = []; // {code, accountId, createdAt, expiresAt, used}
+
+function loadFreeCodes() {
+  try {
+    if (!fs.existsSync(FREE_CODES_FILE)) return;
+    const raw = fs.readFileSync(FREE_CODES_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (data && Array.isArray(data)) {
+      freeCodes = data.filter(
+        (c) =>
+          c &&
+          typeof c.code === "string" &&
+          typeof c.accountId === "string" &&
+          typeof c.expiresAt === "number"
+      );
+    }
+  } catch (err) {
+    console.log("nao foi possivel ler free-codes.json (" + err.message + "); comecando sem codigos.");
+  }
+  pruneFreeCodes();
+}
+function saveFreeCodes() {
+  try {
+    const tmp = FREE_CODES_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(freeCodes), "utf8");
+    fs.renameSync(tmp, FREE_CODES_FILE);
+  } catch (err) {
+    console.log("nao foi possivel gravar free-codes.json: " + err.message);
+  }
+}
+function pruneFreeCodes() {
+  const now = Date.now();
+  const kept = freeCodes.filter((c) => (c.expiresAt || 0) > now);
+  if (kept.length !== freeCodes.length) {
+    freeCodes = kept;
+    saveFreeCodes();
+  }
+}
+
 function cleanStr(v, max) {
   if (typeof v !== "string") return "";
   const s = v.trim();
@@ -771,11 +841,20 @@ app.post("/presence", (req, res) => {
       .json({ error: "invalid_location", message: "lat/lng are required." });
   }
   // Diaria: so fica online (e mantem o heartbeat) quem tem a diaria
-  // valida — paga, isento (a dona) ou modo gratuito ligado. Conta
-  // conhecida sem diaria valida recebe 402. Conta desconhecida
-  // (chave antiga, sem conta no servidor) segue como antes.
+  // valida — paga, isento (a dona) ou modo gratuito ligado COM a conta
+  // liberada pela dona (freeAuthorized, v1.8.11). Conta conhecida sem
+  // diaria valida recebe 402: free_authorization_required no modo
+  // gratuito sem liberacao, fee_required nos demais casos. Conta
+  // desconhecida (chave antiga, sem conta no servidor) segue como antes.
   const account = findAccountById(key);
   if (account && !isFeeValid(account)) {
+    const reason = feeBlockReason(account);
+    if (reason === "free_authorization_required") {
+      return res.status(402).json({
+        error: "free_authorization_required",
+        message: "free work requires the admin authorization code."
+      });
+    }
     return res.status(402).json({
       error: "fee_required",
       message: "daily fee is required to go online."
@@ -997,10 +1076,20 @@ app.post("/calls/:id/accept", (req, res) => {
     });
   }
   // Diaria: so aceita chamado quem tem a diaria valida — paga,
-  // isento (a dona) ou modo gratuito ligado. Conta conhecida sem
-  // diaria valida recebe 402. Conta desconhecida segue como antes.
+  // isento (a dona) ou modo gratuito ligado COM a conta liberada
+  // pela dona (freeAuthorized, v1.8.11). Conta conhecida sem diaria
+  // valida recebe 402: free_authorization_required no modo gratuito
+  // sem liberacao, fee_required nos demais casos. Conta desconhecida
+  // segue como antes.
   const account = findAccountById(key);
   if (account && !isFeeValid(account)) {
+    const reason = feeBlockReason(account);
+    if (reason === "free_authorization_required") {
+      return res.status(402).json({
+        error: "free_authorization_required",
+        message: "free work requires the admin authorization code."
+      });
+    }
     return res.status(402).json({
       error: "fee_required",
       message: "daily fee is required to accept calls."
@@ -1538,12 +1627,18 @@ function saveAuthStore() {
 // contas criadas antes da v1.6.0, que nao tinham o campo) e
 // nao-admin com feeExempt perde (a isencao so nasce no registro da
 // primeira conta). Grava de volta se algo mudou.
+// Liberacao para trabalhar de graca (v1.8.11): conta sem o campo
+// freeAuthorized (criada antes da v1.8.11) nasce nao-liberada.
 function normalizeFeeExempt() {
   let changed = false;
   for (const a of authStore.accounts) {
     const exempt = !!a.isAdmin;
     if (!!a.feeExempt !== exempt) {
       a.feeExempt = exempt;
+      changed = true;
+    }
+    if (typeof a.freeAuthorized !== "boolean") {
+      a.freeAuthorized = false;
       changed = true;
     }
   }
@@ -1576,15 +1671,32 @@ function checkPassword(password, stored) {
 }
 
 // Diaria valida? A conta esta liberada quando: e ISENTA (a dona,
-// administradora — feeExempt: true), OU o modo gratuito esta ligado
-// (freeFee em /settings), OU a diaria paga ainda nao venceu
-// (paidUntil no futuro). E o que o app usa (via GET /auth/me) e o
-// que o servidor confere em /presence e em /calls/:id/accept.
+// administradora — feeExempt: true), OU a diaria paga ainda nao
+// venceu (paidUntil no futuro — vale sempre, com ou sem modo
+// gratuito), OU o modo gratuito esta ligado (freeFee em /settings)
+// E a conta foi LIBERADA pela dona (freeAuthorized: true, v1.8.11 —
+// o codigo de liberacao). Sem liberacao, o gratuito nao libera
+// ninguem. E o que o app usa (via GET /auth/me) e o que o servidor
+// confere em /presence e em /calls/:id/accept.
 function isFeeValid(account) {
   if (!account) return false;
   if (account.feeExempt) return true;
-  if (appSettings.freeFee) return true;
-  return (account.paidUntil || 0) > Date.now();
+  if ((account.paidUntil || 0) > Date.now()) return true;
+  if (appSettings.freeFee) return !!account.freeAuthorized;
+  return false;
+}
+
+// Por que a conta NAO pode trabalhar (null = pode): distingue o
+// bloqueio do modo gratuito sem liberacao (o app mostra o pedido do
+// codigo) do bloqueio da diaria vencida (o app mostra o Pix).
+// So e chamado quando isFeeValid ja deu false.
+function feeBlockReason(account) {
+  if (!account) return null;
+  if (isFeeValid(account)) return null;
+  if (appSettings.freeFee && !account.feeExempt && (account.paidUntil || 0) <= Date.now()) {
+    return "free_authorization_required";
+  }
+  return "fee_required";
 }
 
 // Dias de validade da diaria DESTA conta (v1.8.8): a conta pode ter
@@ -1618,6 +1730,12 @@ function accountPublic(a) {
     paidUntil: a.paidUntil || 0,
     isAdmin: !!a.isAdmin,
     feeExempt: !!a.feeExempt,
+    // Liberada para trabalhar de graca (v1.8.11): a dona gerou o codigo
+    // e a conta digitou — so vale enquanto o modo gratuito estiver
+    // ligado. Incluido em toda resposta com a conta (GET /auth/users,
+    // /auth/me, register, login...), para o app e a Administracao
+    // mostrarem o status e a dona revogar quando quiser.
+    freeAuthorized: !!a.freeAuthorized,
     // Dias da diaria desta conta (v1.8.8): null = usar a configuracao
     // geral (feeDays em /settings). Incluido em toda resposta com a
     // conta (GET /auth/users, /auth/me, register, login...), para a
@@ -1768,6 +1886,9 @@ app.post("/auth/register", (req, res) => {
     // A primeira conta (a dona, administradora) e ISENTA da diaria:
     // trabalha sem pagar nada. Nenhuma outra conta nasce isenta.
     feeExempt: isAdmin,
+    // Nenhuma conta nasce liberada para trabalhar de graca (v1.8.11):
+    // a liberacao so vem quando a dona gera o codigo e a conta digita.
+    freeAuthorized: false,
     createdAt: Date.now()
   };
   authStore.accounts.push(account);
@@ -1963,6 +2084,78 @@ app.post("/auth/fee", requireAuth, async (req, res) => {
   return res.json({ ok: true, account: accountPublic(req.account) });
 });
 
+// POST /auth/free-code/generate — a DONA gera o codigo de liberacao
+// para UMA conta (v1.8.11, so admin). Corpo: { accountId }. O codigo
+// tem 6 digitos, vale 30 min e e de uso unico; gerar outro para a
+// mesma conta invalida o anterior (os antigos sao apagados). O codigo
+// e devolvido na resposta para a dona copiar e mandar no WhatsApp
+// dela mesma — o servidor NAO manda WhatsApp nenhum. So existe no
+// modo gratuito: com freeFee desligado, recusa 409 free_mode_off.
+// Conta inexistente: 404.
+app.post("/auth/free-code/generate", requireAuth, requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const accountId = typeof body.accountId === "string" ? body.accountId : "";
+  const target = findAccountById(accountId);
+  if (!target) {
+    return res.status(404).json({ error: "account_not_found", message: "account not found." });
+  }
+  if (!appSettings.freeFee) {
+    return res.status(409).json({
+      error: "free_mode_off",
+      message: "free mode is off; the code only exists in free mode."
+    });
+  }
+  pruneFreeCodes();
+  freeCodes = freeCodes.filter((c) => c.accountId !== accountId);
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const now = Date.now();
+  freeCodes.push({
+    code,
+    accountId,
+    createdAt: now,
+    expiresAt: now + FREE_CODE_TTL_MS,
+    used: false
+  });
+  saveFreeCodes();
+  return res.json({ ok: true, code, accountId, expiresAt: now + FREE_CODE_TTL_MS });
+});
+
+// POST /auth/free-code/verify — o MOTOTAXI digita o codigo que a dona
+// mandou no WhatsApp (v1.8.11). Corpo: { code }. O codigo so vale
+// para a conta de QUEM ESTA LOGADO (codigo de outra conta nao serve),
+// se nao foi usado e se nao expirou (30 min). Certo: marca o codigo
+// como usado e poe freeAuthorized=true na conta — ela trabalha de
+// graca enquanto o gratuito estiver ligado. Errado/expirado/usado:
+// 400 invalid_code (a mesma resposta para nao revelar qual e o
+// motivo). Com freeFee desligado, recusa 409 free_mode_off — o
+// codigo nao vale e a conta tem que pagar a diaria.
+app.post("/auth/free-code/verify", requireAuth, (req, res) => {
+  const body = req.body || {};
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  if (!appSettings.freeFee) {
+    return res.status(409).json({
+      error: "free_mode_off",
+      message: "free mode is off; pay the daily fee to work."
+    });
+  }
+  if (!code) {
+    return res.status(400).json({ error: "invalid_code", message: "invalid or expired code." });
+  }
+  pruneFreeCodes();
+  const now = Date.now();
+  const rec = freeCodes.find(
+    (c) => c.code === code && c.accountId === req.account.id
+  );
+  if (!rec || rec.used || rec.expiresAt <= now) {
+    return res.status(400).json({ error: "invalid_code", message: "invalid or expired code." });
+  }
+  rec.used = true;
+  saveFreeCodes();
+  req.account.freeAuthorized = true;
+  saveAuthStore();
+  return res.json({ ok: true, account: accountPublic(req.account) });
+});
+
 // GET /auth/users — admin lista as contas (para buscar pelo nome,
 // redefinir senha e apagar conta). Nunca devolve o hash. Cada conta
 // traz feeDays (v1.8.8): null quando a conta usa a configuracao
@@ -1974,13 +2167,16 @@ app.get("/auth/users", requireAuth, requireAdmin, (req, res) => {
 });
 
 // PATCH /auth/users/:id — o admin EDITA uma conta (v1.8.8, pedidos
-// dela 09/11 10:42 e 10:43). Corpo: { name?, phone?, feeDays? } —
-// todos opcionais; feeDays pode ser inteiro >= 1 (dias da diaria
-// SO desta conta) ou null (volta a usar a configuracao geral).
-// Valida TUDO antes de alterar qualquer coisa: valor invalido
-// responde 400 e nao altera nada. So mexe nestes tres campos —
-// nunca em isAdmin, feeExempt, senha ou paidUntil: nem a propria
-// conta do admin pode perder o admin ou a isencao por aqui.
+// dela 09/11 10:42 e 10:43). Corpo: { name?, phone?, feeDays?,
+// freeAuthorized? } — todos opcionais; feeDays pode ser inteiro >= 1
+// (dias da diaria SO desta conta) ou null (volta a usar a
+// configuracao geral); freeAuthorized (v1.8.11) e booleano: false
+// REVOGA a liberacao para trabalhar de graca (a conta volta a
+// precisar do codigo) e true libera direto, sem codigo. Valida TUDO
+// antes de alterar qualquer coisa: valor invalido responde 400 e nao
+// altera nada. So mexe nestes quatro campos — nunca em isAdmin,
+// feeExempt, senha ou paidUntil: nem a propria conta do admin pode
+// perder o admin ou a isencao por aqui.
 // Mudar o feeDays nao altera um paidUntil ja pago (vale para o
 // proximo pagamento). Conta inexistente: 404.
 app.patch("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
@@ -1992,6 +2188,7 @@ app.patch("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
   let newName;
   let newPhone;
   let newFeeDays;
+  let newFreeAuthorized;
   if (body.name !== undefined) {
     newName = cleanStr(body.name, 80);
     if (!newName) {
@@ -2020,12 +2217,22 @@ app.patch("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
       });
     }
   }
+  if (body.freeAuthorized !== undefined) {
+    if (typeof body.freeAuthorized !== "boolean") {
+      return res.status(400).json({
+        error: "invalid_freeAuthorized",
+        message: "freeAuthorized must be a boolean."
+      });
+    }
+    newFreeAuthorized = body.freeAuthorized;
+  }
   if (newName !== undefined) target.name = newName;
   if (newPhone !== undefined) target.phone = newPhone;
   if (newFeeDays !== undefined) {
     if (newFeeDays === null) delete target.feeDays;
     else target.feeDays = newFeeDays;
   }
+  if (newFreeAuthorized !== undefined) target.freeAuthorized = newFreeAuthorized;
   saveAuthStore();
   return res.json({ ok: true, account: accountPublic(target) });
 });
@@ -2095,6 +2302,7 @@ app.delete("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
 loadAuthStore();
 loadAppSettings();
 loadPixCharges();
+loadFreeCodes();
 
 app.listen(PORT, () => {
   console.log("moto-taxi-backend listening on port " + PORT);

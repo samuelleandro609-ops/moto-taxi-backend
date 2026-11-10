@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * test-local.js — testes locais do moto-taxi-backend (v1.8.9).
+ * test-local.js — testes locais do moto-taxi-backend (v1.8.11).
  *
  * Sobe o server.js numa porta de teste (PORT=3101) e testa por HTTP.
  * NAO chama nenhum endpoint /auth/* — os testes nunca tocam no
@@ -134,6 +134,52 @@ async function run() {
   } catch (e) {
     // nao existia: nada a limpar
   }
+  // Modo Postgres (DATABASE_URL): o banco persiste entre execucoes, ao
+  // contrario do arquivo que e apagado acima. Limpa a tabela auth_store
+  // para o teste comecar do zero (1a conta vira admin). Sem isto, a 2a
+  // execucao encontra as contas da 1a e a "1a conta" ja nao e admin.
+  // Banco separado para o teste de diaria (secao s): a 3a instancia usa
+  // seu proprio arquivo de contas no modo arquivo; no modo Postgres ela
+  // precisa do proprio banco, senao a "Admin Fee" nao e a 1a conta.
+  let feeDbUrl = null;
+  if (process.env.DATABASE_URL) {
+    try {
+      const { Client } = require("pg");
+      const c = new Client({ connectionString: process.env.DATABASE_URL });
+      await c.connect();
+      try {
+        await c.query("DROP TABLE IF EXISTS auth_store");
+      } finally {
+        await c.end();
+      }
+      const baseUrl = new URL(process.env.DATABASE_URL);
+      const dbName = (baseUrl.pathname.replace(/\/$/, "").split("/").pop() || "mototaxi_test") + "_fee";
+      const adminUrl = new URL(process.env.DATABASE_URL);
+      adminUrl.pathname = "/postgres";
+      const admin = new Client({ connectionString: adminUrl.toString() });
+      await admin.connect();
+      try {
+        await admin.query("CREATE DATABASE \"" + dbName.replace(/"/g, '""') + "\"");
+      } catch (e) {
+        if (!/already exists/.test(e.message)) throw e;
+      } finally {
+        await admin.end();
+      }
+      const feeUrl = new URL(process.env.DATABASE_URL);
+      feeUrl.pathname = "/" + dbName;
+      feeDbUrl = feeUrl.toString();
+      // Limpa tambem o banco de diaria (persiste entre execucoes).
+      const feeClient = new Client({ connectionString: feeDbUrl });
+      await feeClient.connect();
+      try {
+        await feeClient.query("DROP TABLE IF EXISTS auth_store");
+      } finally {
+        await feeClient.end();
+      }
+    } catch (e) {
+      console.log("aviso: nao foi possivel preparar o Postgres para o teste (" + e.message + ")");
+    }
+  }
   const child = spawn(process.execPath, [path.join(__dirname, "server.js")], {
     env: Object.assign({}, process.env, {
       PORT: String(PORT),
@@ -162,7 +208,7 @@ async function run() {
     // (g) regressao: versao e settings
     console.log("== regressao: versao e settings ==");
     const root = await req("GET", "/");
-    check("GET / retorna version 1.8.9", root.status === 200 && root.data && root.data.version === "1.8.9", JSON.stringify(root.data));
+    check("GET / retorna version 1.8.11", root.status === 200 && root.data && root.data.version === "1.8.11", JSON.stringify(root.data));
     const settings = await req("GET", "/settings");
     check("GET /settings traz feeDays 1", settings.status === 200 && settings.data && settings.data.feeDays === 1, JSON.stringify(settings.data));
 
@@ -940,7 +986,7 @@ async function run() {
         ACCOUNTS_FILE: ACCOUNTS_FEE_TEST_FILE,
         MP_ACCESS_TOKEN: "test-token",
         MP_API_BASE: "http://127.0.0.1:" + MOCK_MP_PORT + "/v1/payments"
-      }),
+      }, feeDbUrl ? { DATABASE_URL: feeDbUrl } : {}),
       stdio: ["ignore", "pipe", "pipe"]
     });
     try {
