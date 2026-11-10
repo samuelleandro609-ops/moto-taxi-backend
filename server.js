@@ -252,7 +252,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.9" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.10" });
 });
 
 app.post("/create-pix", requireAuth, async (req, res) => {
@@ -320,6 +320,7 @@ app.post("/create-pix", requireAuth, async (req, res) => {
     // pelo aparelho.
     prunePixCharges();
     pixCharges.set(external_ref, { amount, fee: appSettings.fee, createdAt: Date.now() });
+    savePixCharges(); // persiste na hora: a cobrança sobrevive ao reinicio
     return res.status(201).json({
       id: d.id,
       status: d.status,
@@ -633,14 +634,54 @@ let callSeq = 0;
 // Cobrancas Pix da diaria ja criadas (external_ref -> {amount, fee,
 // createdAt}): o /auth/fee confere o pagamento contra o valor cobrado e
 // contra o valor da diaria na hora da cobranca, para ninguem liberar a
-// diaria com um pagamento de outro valor. Some com o reinicio (o
-// /auth/fee cai para o valor atual da diaria nesse caso).
+// diaria com um pagamento de outro valor. PERSISTIDAS em pix-charges.json
+// (v1.8.10, mesmo padrao atomico do settings.json): antes viviam SO na
+// memoria e sumiam no reinicio — ai o /auth/fee caia para o valor ATUAL
+// da diaria e recusava um pagamento feito com o valor ANTIGO (ex.: a
+// dona mudou a diaria de R$ 10 para R$ 1 e o mototaxi pagou a cobrança
+// de R$ 10 gerada antes da mudança: o pagamento era rejeitado e a
+// diaria nao liberava, mesmo com o dinheiro pago). Com o arquivo, a
+// cobrança sobrevive ao reinicio e o pagamento do valor cobrado e
+// aceito. Validade 24h (prune), como antes.
+const PIX_CHARGES_FILE =
+  process.env.PIX_CHARGES_FILE || path.join(__dirname, "pix-charges.json");
 const pixCharges = new Map();
+function loadPixCharges() {
+  try {
+    if (!fs.existsSync(PIX_CHARGES_FILE)) return;
+    const raw = fs.readFileSync(PIX_CHARGES_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object") {
+      for (const k of Object.keys(data)) {
+        const v = data[k];
+        if (v && typeof v.amount === "number" && typeof v.createdAt === "number") {
+          pixCharges.set(k, { amount: v.amount, fee: v.fee, createdAt: v.createdAt });
+        }
+      }
+    }
+  } catch (err) {
+    console.log("nao foi possivel ler pix-charges.json (" + err.message + "); comecando sem cobrancas registradas.");
+  }
+  prunePixCharges();
+}
+function savePixCharges() {
+  try {
+    const obj = {};
+    pixCharges.forEach((v, k) => { obj[k] = v; });
+    const tmp = PIX_CHARGES_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(obj), "utf8");
+    fs.renameSync(tmp, PIX_CHARGES_FILE);
+  } catch (err) {
+    console.log("nao foi possivel gravar pix-charges.json: " + err.message);
+  }
+}
 function prunePixCharges() {
   const now = Date.now();
+  let removed = false;
   pixCharges.forEach((v, k) => {
-    if (now - (v.createdAt || 0) > 24 * 3600 * 1000) pixCharges.delete(k);
+    if (now - (v.createdAt || 0) > 24 * 3600 * 1000) { pixCharges.delete(k); removed = true; }
   });
+  if (removed) savePixCharges();
 }
 
 function cleanStr(v, max) {
@@ -2053,6 +2094,7 @@ app.delete("/auth/users/:id", requireAuth, requireAdmin, (req, res) => {
 
 loadAuthStore();
 loadAppSettings();
+loadPixCharges();
 
 app.listen(PORT, () => {
   console.log("moto-taxi-backend listening on port " + PORT);
