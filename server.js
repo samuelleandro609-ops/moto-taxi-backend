@@ -169,6 +169,13 @@
  * continua para a diaria vencida com o gratuito desligado).
  * GET /auth/users (e toda resposta com a conta) passa a incluir
  * freeAuthorized. Os codigos vivem em free-codes.json (persistido).
+ *
+ * v1.8.12: CORS — a lista de metodos permitidos no preflight era so
+ * GET, POST, OPTIONS, entao o navegador BLOQUEAVA os pedidos DELETE
+ * (apagar conta) e PATCH (editar conta, revogar liberacao) vindos do
+ * site, e o app mostrava "Sem conexao com o servidor" mesmo com o
+ * servidor no ar. A lista passa a ser GET, POST, PATCH, DELETE,
+ * OPTIONS. Nada mais muda.
  */
 
 const express = require("express");
@@ -198,7 +205,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
     res.setHeader("Vary", "Origin");
     if (req.method === "OPTIONS") {
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Access-Control-Max-Age", "86400");
       return res.sendStatus(204);
@@ -274,7 +281,7 @@ function mpErrorDetail(result) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.11" });
+  res.json({ ok: true, service: "moto-taxi-backend", version: "1.8.12" });
 });
 
 app.post("/create-pix", requireAuth, async (req, res) => {

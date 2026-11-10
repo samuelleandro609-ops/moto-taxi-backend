@@ -95,7 +95,7 @@ async function main() {
   if (!ready) { srv.kill(); mockMp.close(); process.exit(1); }
 
   const root = await req("GET", "/");
-  check("versao 1.8.11", root.j && root.j.version === "1.8.11", JSON.stringify(root.j));
+  check("versao 1.8.12", root.j && root.j.version === "1.8.12", JSON.stringify(root.j));
 
   // Contas: admin (primeira = dona, isenta), 3 mototaxis e 1 cliente.
   async function register(name, phone, role) {

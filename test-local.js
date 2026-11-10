@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * test-local.js — testes locais do moto-taxi-backend (v1.8.11).
+ * test-local.js — testes locais do moto-taxi-backend (v1.8.12).
  *
  * Sobe o server.js numa porta de teste (PORT=3101) e testa por HTTP.
  * NAO chama nenhum endpoint /auth/* — os testes nunca tocam no
@@ -208,7 +208,7 @@ async function run() {
     // (g) regressao: versao e settings
     console.log("== regressao: versao e settings ==");
     const root = await req("GET", "/");
-    check("GET / retorna version 1.8.11", root.status === 200 && root.data && root.data.version === "1.8.11", JSON.stringify(root.data));
+    check("GET / retorna version 1.8.12", root.status === 200 && root.data && root.data.version === "1.8.12", JSON.stringify(root.data));
     const settings = await req("GET", "/settings");
     check("GET /settings traz feeDays 1", settings.status === 200 && settings.data && settings.data.feeDays === 1, JSON.stringify(settings.data));
 
